@@ -396,7 +396,7 @@ struct CanvasTool {
 #[tool_router]
 impl CanvasTool {
     #[tool(
-        description = "Authenticate the Canvas connector with the user's institutional login. Use this tool whenever another Canvas tool reports that cookies are missing, the session expired, or Canvas redirected to a login page. Before calling it, inform the user that the Canvas session is not authenticated and that a visible browser will open; ask them to finish signing in and close the browser window when done. The connector safely replaces its headless browser with the interactive browser and restores the headless session afterward."
+        description = "Authenticate the Canvas connector with the user's institutional login. Use this tool whenever another Canvas tool reports that cookies are missing, the session expired, or Canvas redirected to a login page. Before calling it, inform the user that the Canvas session is not authenticated and that a visible browser will open; ask them to finish signing in and close the browser window when done. The connector refreshes its cached cookies afterward and closes the browser."
     )]
     async fn auth(&self) -> Result<CallToolResult, ErrorData> {
         let user = self.api.authenticate().await.map_err(|e| {

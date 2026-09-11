@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thirtyfour::extensions::query::ElementPollerWithTimeout;
 use thirtyfour::prelude::*;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 const CANVAS_URL_ENV: &str = "CANVAS_URL";
 const HTTP_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
@@ -109,12 +109,33 @@ async fn canvas_driver(canvas_origin: &reqwest::Url, headless: bool) -> anyhow::
             Duration::from_millis(500),
         )))
         .await?;
-    driver.goto(canvas_origin.as_str()).await?;
+    if let Err(error) = driver.goto(canvas_origin.as_str()).await {
+        let _ = driver.quit().await;
+        return Err(error.into());
+    }
     Ok(driver)
 }
 
-pub async fn interactive_login() -> anyhow::Result<()> {
-    let driver = canvas_driver(&configured_canvas_url()?, false).await?;
+// Only browser operations need exclusive access to the shared Chrome profile.
+// The OS releases this lock when the file is dropped, including on process exit.
+async fn lock_chrome_profile() -> anyhow::Result<std::fs::File> {
+    tokio::task::spawn_blocking(|| {
+        let profile = chrome_profile_dir()?;
+        std::fs::create_dir_all(&profile)?;
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.with_extension("lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    })
+    .await?
+}
+
+async fn login(canvas_origin: &reqwest::Url) -> anyhow::Result<()> {
+    let driver = canvas_driver(canvas_origin, false).await?;
 
     while driver
         .windows()
@@ -128,77 +149,68 @@ pub async fn interactive_login() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn interactive_login() -> anyhow::Result<()> {
+    let canvas_origin = configured_canvas_url()?;
+    let _profile_lock = lock_chrome_profile().await?;
+    login(&canvas_origin).await
+}
+
+// Caller holds the profile lock until Chrome has finished shutting down.
+async fn load_cookie_header(canvas_origin: &reqwest::Url) -> anyhow::Result<String> {
+    let driver = canvas_driver(canvas_origin, true).await?;
+    let cookies = driver.get_all_cookies().await;
+    let shutdown = driver.quit().await;
+    let cookies = cookies?;
+    shutdown?;
+    Ok(cookies
+        .into_iter()
+        .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
 #[derive(Clone)]
 pub struct CanvasApi {
     canvas_origin: reqwest::Url,
-    driver: Arc<Mutex<Option<WebDriver>>>,
+    cookie_header: Arc<RwLock<String>>,
     client: reqwest::Client,
 }
 
 impl CanvasApi {
     pub async fn new() -> anyhow::Result<Self> {
         let canvas_origin = configured_canvas_url()?;
-        let driver = canvas_driver(&canvas_origin, true).await?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()?;
+        let cookie_header = {
+            let _profile_lock = lock_chrome_profile().await?;
+            load_cookie_header(&canvas_origin).await?
+        };
         Ok(Self {
             canvas_origin,
-            driver: Arc::new(Mutex::new(Some(driver))),
+            cookie_header: Arc::new(RwLock::new(cookie_header)),
             client,
         })
     }
 
     async fn canvas_cookie_header(&self) -> anyhow::Result<String> {
-        let driver = self.driver.lock().await;
-        let driver = driver
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Canvas authentication is in progress"))?;
-        let cookies = driver.get_all_cookies().await?;
-        if cookies.is_empty() {
+        let cookie_header = self.cookie_header.read().await;
+        if cookie_header.is_empty() {
             anyhow::bail!(
                 "no Canvas cookies are available; sign in with the configured browser profile"
             );
         }
-        Ok(cookies
-            .into_iter()
-            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
-            .collect::<Vec<_>>()
-            .join("; "))
+        Ok(cookie_header.clone())
     }
 
     pub async fn authenticate(&self) -> anyhow::Result<AuthenticatedUser> {
-        let mut driver_slot = self.driver.lock().await;
-        if let Some(driver) = driver_slot.take() {
-            let _ = driver.quit().await;
+        {
+            let _profile_lock = lock_chrome_profile().await?;
+            login(&self.canvas_origin).await?;
+            let cookies = load_cookie_header(&self.canvas_origin).await?;
+            *self.cookie_header.write().await = cookies;
         }
-
-        let login_result = async {
-            let driver = canvas_driver(&self.canvas_origin, false).await?;
-            while driver
-                .windows()
-                .await
-                .is_ok_and(|handles| !handles.is_empty())
-            {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let _ = driver.quit().await;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        let replacement = canvas_driver(&self.canvas_origin, true).await;
-        match replacement {
-            Ok(driver) => *driver_slot = Some(driver),
-            Err(error) => {
-                return Err(anyhow::anyhow!(
-                    "failed to restore the headless Canvas session: {error}"
-                ));
-            }
-        }
-        drop(driver_slot);
-
-        login_result?;
         self.api_get("/api/v1/users/self/profile", &[]).await
     }
 
@@ -954,6 +966,26 @@ mod tests {
 
     fn example_origin() -> reqwest::Url {
         reqwest::Url::parse("https://canvas.example.edu").unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_use_cached_cookies_shared_across_clones() {
+        let api = CanvasApi {
+            canvas_origin: example_origin(),
+            cookie_header: Arc::new(RwLock::new(String::new())),
+            client: reqwest::Client::new(),
+        };
+        let clone = api.clone();
+        assert!(clone.canvas_cookie_header().await.is_err());
+
+        *api.cookie_header.write().await = "session=first".into();
+        assert_eq!(clone.canvas_cookie_header().await.unwrap(), "session=first");
+
+        *api.cookie_header.write().await = "session=refreshed".into();
+        assert_eq!(
+            clone.canvas_cookie_header().await.unwrap(),
+            "session=refreshed"
+        );
     }
 
     #[test]
