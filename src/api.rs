@@ -81,6 +81,25 @@ fn validate_numeric_id(kind: &str, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn attachment_url(canvas_origin: &reqwest::Url, resource: &str) -> anyhow::Result<reqwest::Url> {
+    let path = resource
+        .strip_prefix("canvas://")
+        .or_else(|| resource.strip_prefix("canvas-text://"))
+        .ok_or_else(|| anyhow::anyhow!("unsupported resource URI: {resource}"))?;
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        anyhow::bail!("invalid Canvas resource URI: {resource}");
+    }
+
+    // A resource payload can be an absolute URL, even without a leading slash.
+    // Validate the resolved origin before attaching session cookies.
+    let url = canvas_origin.join(path)?;
+    canvas_resource_path(canvas_origin, url.as_str())?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("Canvas attachment URL must not contain credentials");
+    }
+    Ok(url)
+}
+
 fn canvas_api_path(canvas_origin: &reqwest::Url, segments: &[&str]) -> anyhow::Result<String> {
     let mut url = canvas_origin.clone();
     {
@@ -368,19 +387,9 @@ impl CanvasApi {
     }
 
     pub async fn attachment(&self, resource: &str) -> anyhow::Result<AttachmentContents> {
-        let path = resource
-            .strip_prefix("canvas://")
-            .or_else(|| resource.strip_prefix("canvas-text://"))
-            .ok_or_else(|| anyhow::anyhow!("unsupported resource URI: {resource}"))?;
-        if path.is_empty() || path.starts_with('/') || path.contains("\\") {
-            anyhow::bail!("invalid Canvas resource URI: {resource}");
-        }
-
+        let url = attachment_url(&self.canvas_origin, resource)?;
         let cookie_header = self.canvas_cookie_header().await?;
-        let mut request = self
-            .client
-            .get(self.canvas_origin.join(path)?)
-            .header(USER_AGENT, HTTP_USER_AGENT);
+        let mut request = self.client.get(url).header(USER_AGENT, HTTP_USER_AGENT);
         if !cookie_header.is_empty() {
             request = request.header(COOKIE, cookie_header);
         }
@@ -986,6 +995,46 @@ mod tests {
             clone.canvas_cookie_header().await.unwrap(),
             "session=refreshed"
         );
+    }
+
+    #[test]
+    fn attachment_resources_preserve_canvas_download_urls() {
+        for prefix in ["canvas://", "canvas-text://"] {
+            let url = attachment_url(
+                &example_origin(),
+                &format!("{prefix}files/99/download?download_frd=1&verifier=example"),
+            )
+            .unwrap();
+            assert_eq!(
+                url.as_str(),
+                "https://canvas.example.edu/files/99/download?download_frd=1&verifier=example"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_resources_reject_foreign_origins_before_using_cookies() {
+        for prefix in ["canvas://", "canvas-text://"] {
+            for payload in [
+                "https://other.example/collect",
+                "https://canvas.example.edu.other.example/collect",
+                "https://canvas.example.edu@other.example/collect",
+                "http://canvas.example.edu/files/99",
+                "https://canvas.example.edu:444/files/99",
+                "//other.example/collect",
+                " https://other.example/collect",
+                "\thttps://other.example/collect",
+                "https:\\other.example\\collect",
+                "file:///etc/passwd",
+                "https://user:password@canvas.example.edu/files/99",
+                "",
+            ] {
+                assert!(
+                    attachment_url(&example_origin(), &format!("{prefix}{payload}")).is_err(),
+                    "accepted unsafe resource payload: {payload:?}"
+                );
+            }
+        }
     }
 
     #[test]
