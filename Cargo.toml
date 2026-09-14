@@ -10,6 +10,7 @@ chrono = "0.4"
 directories = "6"
 lopdf = { version = "0.38", default-features = false }
 pdf-extract = "0.10"
+png = "0.17"
 quick-xml = "0.39"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
@@ -18,3 +19,6 @@ tokio = { version = "1", features = ["full"] }
 rmcp = { version = "3.2", features = [ "server", "macros", "schemars", "transport-io"] }
 thirtyfour = "0.37.5"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+flate2 = "1"
