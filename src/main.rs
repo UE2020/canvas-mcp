@@ -98,8 +98,12 @@ struct PdfImageInfo {
     image: usize,
     width: i64,
     height: i64,
+    color_space: Option<String>,
+    bits_per_component: Option<i64>,
     filters: Vec<String>,
     mime_type: Option<&'static str>,
+    supported: bool,
+    unsupported_reason: Option<String>,
 }
 
 const MAX_INLINE_ATTACHMENT_BYTES: usize = 24 * 1024;
@@ -205,13 +209,101 @@ fn attachment_text(attachment: &api::AttachmentContents) -> Result<String, Strin
 }
 
 fn image_mime_type(filters: &[String]) -> Option<&'static str> {
-    if filters.iter().any(|filter| filter == "DCTDecode") {
-        Some("image/jpeg")
-    } else if filters.iter().any(|filter| filter == "JPXDecode") {
-        Some("image/jp2")
-    } else {
-        None
+    match filters {
+        [filter] if filter == "DCTDecode" => Some("image/jpeg"),
+        [filter] if filter == "JPXDecode" => Some("image/jp2"),
+        _ => None,
     }
+}
+
+fn raw_image_color_type(
+    color_space: Option<&str>,
+    bits_per_component: Option<i64>,
+) -> Result<png::ColorType, String> {
+    if bits_per_component != Some(8) {
+        return Err(format!(
+            "unsupported bits per component {:?}; lossless PDF images currently require 8",
+            bits_per_component
+        ));
+    }
+
+    match color_space {
+        Some("DeviceGray" | "G") => Ok(png::ColorType::Grayscale),
+        Some("DeviceRGB" | "RGB") => Ok(png::ColorType::Rgb),
+        Some(value) => Err(format!("unsupported color space {value:?}")),
+        None => Err("image has no directly supported color space".to_owned()),
+    }
+}
+
+fn raw_image_support(
+    filters: &[String],
+    color_space: Option<&str>,
+    bits_per_component: Option<i64>,
+) -> Result<png::ColorType, String> {
+    if !filters.iter().all(|filter| {
+        matches!(
+            filter.as_str(),
+            "FlateDecode" | "LZWDecode" | "ASCII85Decode"
+        )
+    }) {
+        return Err(format!("unsupported filter chain {filters:?}"));
+    }
+    raw_image_color_type(color_space, bits_per_component)
+}
+
+fn pdf_image_support(
+    filters: &[String],
+    color_space: Option<&str>,
+    bits_per_component: Option<i64>,
+) -> Result<&'static str, String> {
+    if let Some(mime_type) = image_mime_type(filters) {
+        Ok(mime_type)
+    } else {
+        raw_image_support(filters, color_space, bits_per_component).map(|_| "image/png")
+    }
+}
+
+fn encode_png(
+    pixels: &[u8],
+    width: i64,
+    height: i64,
+    color_type: png::ColorType,
+) -> Result<Vec<u8>, String> {
+    let width = u32::try_from(width).map_err(|_| format!("invalid image width {width}"))?;
+    let height = u32::try_from(height).map_err(|_| format!("invalid image height {height}"))?;
+    if width == 0 || height == 0 {
+        return Err(format!("invalid image dimensions {width}x{height}"));
+    }
+    let channels = match color_type {
+        png::ColorType::Grayscale => 1_u64,
+        png::ColorType::Rgb => 3,
+        _ => return Err("unsupported PNG color type".to_owned()),
+    };
+    let expected_len = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|value| value.checked_mul(channels))
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("image dimensions {width}x{height} are too large"))?;
+    if pixels.len() != expected_len {
+        return Err(format!(
+            "decoded image has {} bytes; expected {expected_len} for {width}x{height} {color_type:?}",
+            pixels.len()
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(color_type);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("failed to create PNG: {e}"))?;
+        writer
+            .write_image_data(pixels)
+            .map_err(|e| format!("failed to encode PNG pixels: {e}"))?;
+    }
+    Ok(bytes)
 }
 
 fn pdf_image_info(bytes: &[u8]) -> Result<Vec<PdfImageInfo>, String> {
@@ -222,12 +314,21 @@ fn pdf_image_info(bytes: &[u8]) -> Result<Vec<PdfImageInfo>, String> {
         let images = document.get_page_images(page_id).unwrap_or_default();
         for (index, image) in images.iter().enumerate() {
             let filters = image.filters.clone().unwrap_or_default();
+            let support = pdf_image_support(
+                &filters,
+                image.color_space.as_deref(),
+                image.bits_per_component,
+            );
             info.push(PdfImageInfo {
                 page,
                 image: index + 1,
                 width: image.width,
                 height: image.height,
-                mime_type: image_mime_type(&filters),
+                color_space: image.color_space.clone(),
+                bits_per_component: image.bits_per_component,
+                mime_type: support.as_ref().ok().copied(),
+                supported: support.is_ok(),
+                unsupported_reason: support.err(),
                 filters,
             });
         }
@@ -258,25 +359,49 @@ fn pdf_image(bytes: &[u8], page: u32, index: usize) -> Result<(Vec<u8>, PdfImage
         )
     })?;
     let filters = image.filters.clone().unwrap_or_default();
-    let mime_type = image_mime_type(&filters).ok_or_else(|| {
-        format!(
-            "PDF page {page} image {index} uses unsupported filters {filters:?}; JPEG and JPEG 2000 are supported"
-        )
-    })?;
+    let mime_type = pdf_image_support(
+        &filters,
+        image.color_space.as_deref(),
+        image.bits_per_component,
+    )
+    .map_err(|reason| format!("PDF page {page} image {index} is unsupported: {reason}"))?;
+    let bytes = if mime_type == "image/png" {
+        let stream = document
+            .get_object(image.id)
+            .and_then(lopdf::Object::as_stream)
+            .map_err(|e| format!("failed to read PDF page {page} image {index} stream: {e}"))?;
+        let pixels = stream
+            .decompressed_content()
+            .map_err(|e| format!("failed to decompress PDF page {page} image {index}: {e}"))?;
+        let color_type = raw_image_support(
+            &filters,
+            image.color_space.as_deref(),
+            image.bits_per_component,
+        )?;
+        encode_png(&pixels, image.width, image.height, color_type)?
+    } else {
+        image.content.to_vec()
+    };
     let info = PdfImageInfo {
         page,
         image: index,
         width: image.width,
         height: image.height,
+        color_space: image.color_space.clone(),
+        bits_per_component: image.bits_per_component,
         filters,
         mime_type: Some(mime_type),
+        supported: true,
+        unsupported_reason: None,
     };
-    Ok((image.content.to_vec(), info))
+    Ok((bytes, info))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compression, write::ZlibEncoder};
+    use lopdf::{Dictionary, Document, Object, Stream, dictionary};
     use std::io::Write;
 
     fn one_page_pdf(text: &str) -> Vec<u8> {
@@ -333,6 +458,130 @@ mod tests {
         };
 
         assert_eq!(attachment_text(&attachment).unwrap(), "problem one");
+    }
+
+    fn image_pdf(
+        color_space: &str,
+        bits_per_component: i64,
+        width: i64,
+        height: i64,
+        content: Vec<u8>,
+        decode_params: Option<Dictionary>,
+    ) -> Vec<u8> {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let mut image_dictionary = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => width,
+            "Height" => height,
+            "ColorSpace" => Object::Name(color_space.as_bytes().to_vec()),
+            "BitsPerComponent" => bits_per_component,
+            "Filter" => "FlateDecode",
+        };
+        if let Some(decode_params) = decode_params {
+            image_dictionary.set("DecodeParms", decode_params);
+        }
+        let image_id = document.add_object(Stream::new(image_dictionary, content));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), width.into(), height.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im1" => image_id },
+            },
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut pdf = Vec::new();
+        document.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    fn zlib_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn decode_png(bytes: &[u8]) -> (png::OutputInfo, Vec<u8>) {
+        let decoder = png::Decoder::new(Cursor::new(bytes));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        pixels.truncate(info.buffer_size());
+        (info, pixels)
+    }
+
+    #[test]
+    fn extracts_flate_rgb_image_as_png() {
+        let pixels = vec![255, 0, 0, 0, 255, 0];
+        let pdf = image_pdf("DeviceRGB", 8, 2, 1, zlib_compress(&pixels), None);
+
+        let (bytes, info) = pdf_image(&pdf, 1, 1).unwrap();
+        let (png_info, decoded_pixels) = decode_png(&bytes);
+
+        assert_eq!(info.mime_type, Some("image/png"));
+        assert!(info.supported);
+        assert_eq!(png_info.width, 2);
+        assert_eq!(png_info.height, 1);
+        assert_eq!(png_info.color_type, png::ColorType::Rgb);
+        assert_eq!(decoded_pixels, pixels);
+    }
+
+    #[test]
+    fn extracts_flate_grayscale_image_with_png_predictor() {
+        // PNG predictor rows include a leading filter byte. Zero means no row filter.
+        let predicted = [0, 0, 127, 255];
+        let decode_params = dictionary! {
+            "Predictor" => 15,
+            "Colors" => 1,
+            "BitsPerComponent" => 8,
+            "Columns" => 3,
+        };
+        let pdf = image_pdf(
+            "DeviceGray",
+            8,
+            3,
+            1,
+            zlib_compress(&predicted),
+            Some(decode_params),
+        );
+
+        let (bytes, info) = pdf_image(&pdf, 1, 1).unwrap();
+        let (png_info, decoded_pixels) = decode_png(&bytes);
+
+        assert_eq!(info.mime_type, Some("image/png"));
+        assert_eq!(png_info.color_type, png::ColorType::Grayscale);
+        assert_eq!(decoded_pixels, [0, 127, 255]);
+    }
+
+    #[test]
+    fn reports_unsupported_lossless_image_metadata() {
+        let pixels = vec![0; 4];
+        let pdf = image_pdf("DeviceCMYK", 8, 1, 1, zlib_compress(&pixels), None);
+
+        let info = pdf_image_info(&pdf).unwrap().remove(0);
+
+        assert!(!info.supported);
+        assert_eq!(info.mime_type, None);
+        assert_eq!(info.color_space.as_deref(), Some("DeviceCMYK"));
+        assert!(
+            info.unsupported_reason
+                .unwrap()
+                .contains("unsupported color space")
+        );
     }
 
     fn word_document(document_xml: &str) -> Vec<u8> {
@@ -605,7 +854,7 @@ impl CanvasTool {
     }
 
     #[tool(
-        description = "Read one embedded image from a Canvas PDF attachment. Call attachment_text first to get the available one-based page and image numbers, then use this tool to inspect image-based questions and diagrams."
+        description = "Read one embedded image from a Canvas PDF attachment. Call attachment_text first and select an image whose metadata has supported=true, then pass its one-based page and image numbers to inspect image-based questions and diagrams."
     )]
     async fn attachment_image(
         &self,
