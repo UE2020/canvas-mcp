@@ -207,35 +207,24 @@ pub fn sanitize_filename(name: &str) -> String {
         .last()
         .unwrap_or("attachment");
 
-    // Filter out control characters, illegal filesystem characters, and Unicode BIDI / zero-width characters
+    // Strict allowlist: only ASCII alphanumeric, spaces, and safe punctuation (_ - .)
     let mut cleaned = String::with_capacity(last_segment.len());
     for c in last_segment.chars() {
-        if c.is_control() {
-            continue;
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ') {
+            cleaned.push(c);
+        } else {
+            cleaned.push('_');
         }
-        if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0') {
-            continue;
-        }
-        if matches!(
-            c,
-            '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-        ) {
-            continue;
-        }
-        cleaned.push(c);
     }
 
-    // Strip leading/trailing whitespace and trailing dots (Windows strips trailing dots/spaces)
+    // Strip leading/trailing whitespace and dots (Windows strips trailing dots/spaces)
     let trimmed = cleaned
         .trim()
-        .trim_end_matches(|c| c == ' ' || c == '.')
+        .trim_matches(|c| c == ' ' || c == '.')
         .to_owned();
 
-    // If empty or all dots (e.g. "." or ".."), fall back to default
-    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
+    // If empty or all dots/underscores (e.g. "." or ".."), fall back to default
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.' || c == '_') {
         return "attachment".to_owned();
     }
 
@@ -397,6 +386,80 @@ fn default_attachment_filename(mime_type: Option<&str>) -> String {
         _ => "",
     };
     format!("attachment{ext}")
+}
+
+pub fn extract_file_id_from_resource(resource: &str) -> Option<String> {
+    let clean = resource
+        .strip_prefix("canvas://")
+        .or_else(|| resource.strip_prefix("canvas-text://"))
+        .unwrap_or(resource);
+    let path = if let Ok(url) = reqwest::Url::parse(clean) {
+        url.path().to_string()
+    } else {
+        clean.to_string()
+    };
+    let trimmed = path.trim_start_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("files/") {
+        let id_part: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id_part.is_empty() {
+            return Some(id_part);
+        }
+    }
+    None
+}
+
+pub fn safe_attachment_filename(resource: &str, raw_name: &str) -> String {
+    let clean = sanitize_filename(raw_name);
+    if let Some(file_id) = extract_file_id_from_resource(resource) {
+        if clean.starts_with(&format!("{file_id}_")) || clean.starts_with(&format!("{file_id}-")) {
+            clean
+        } else {
+            format!("{file_id}_{clean}")
+        }
+    } else {
+        clean
+    }
+}
+
+pub async fn resolve_and_contain_path(
+    destination: Option<&str>,
+    filename: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let default_dir = match std::env::var("CANVAS_DOWNLOAD_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir.trim()),
+        _ => std::env::current_dir()?.join("downloads"),
+    };
+
+    let target_path = match destination {
+        Some(dest) if !dest.trim().is_empty() => {
+            let trimmed = dest.trim();
+            let path = Path::new(trimmed);
+            let is_dir = path.is_dir()
+                || trimmed.ends_with('/')
+                || trimmed.ends_with('\\')
+                || (path.extension().is_none() && !path.is_file());
+            if is_dir {
+                path.join(filename)
+            } else {
+                path.to_path_buf()
+            }
+        }
+        _ => default_dir.join(filename),
+    };
+
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+
+    let absolute = if target_path.is_absolute() {
+        target_path
+    } else {
+        std::env::current_dir()?.join(&target_path)
+    };
+
+    Ok(absolute)
 }
 
 
@@ -782,9 +845,54 @@ impl CanvasApi {
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(|value| value.to_owned());
+        let header_filename = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(extract_content_disposition_filename);
         let bytes = response.bytes().await?.to_vec();
 
-        Ok(AttachmentContents { bytes, mime_type })
+        Ok(AttachmentContents {
+            bytes,
+            mime_type,
+            filename: header_filename,
+        })
+    }
+
+    pub async fn save_attachment_to_disk(
+        &self,
+        resource: &str,
+        bytes: &[u8],
+        header_filename: Option<&str>,
+        mime_type: Option<&str>,
+        destination_path: Option<&str>,
+    ) -> anyhow::Result<DownloadedFile> {
+        let raw_filename = if let Some(h) = header_filename.filter(|s| !s.trim().is_empty()) {
+            h.to_owned()
+        } else {
+            let url = attachment_url(&self.canvas_origin, resource)?;
+            let url_segment = url
+                .path_segments()
+                .and_then(|mut segs| segs.next_back())
+                .filter(|seg| !seg.is_empty() && *seg != "download");
+            if let Some(seg) = url_segment {
+                percent_decode_str(seg)
+            } else {
+                default_attachment_filename(mime_type)
+            }
+        };
+
+        let filename = safe_attachment_filename(resource, &raw_filename);
+        let target_path = resolve_and_contain_path(destination_path, &filename).await?;
+
+        tokio::fs::write(&target_path, bytes).await?;
+
+        Ok(DownloadedFile {
+            saved_path: target_path.to_string_lossy().into_owned(),
+            filename,
+            bytes: bytes.len() as u64,
+            mime_type: mime_type.map(str::to_owned),
+        })
     }
 
     pub async fn download_attachment(
@@ -813,10 +921,10 @@ impl CanvasApi {
             .and_then(|value| value.to_str().ok())
             .and_then(extract_content_disposition_filename);
 
-        let mut final_filename = if let Some(override_name) =
+        let raw_filename = if let Some(override_name) =
             filename_override.filter(|s| !s.trim().is_empty())
         {
-            sanitize_filename(override_name)
+            override_name.to_owned()
         } else if let Some(header_name) = header_filename {
             header_name
         } else {
@@ -825,50 +933,19 @@ impl CanvasApi {
                 .and_then(|mut segs| segs.next_back())
                 .filter(|seg| !seg.is_empty() && *seg != "download");
             if let Some(seg) = url_segment {
-                let decoded = percent_decode_str(seg);
-                let cleaned = sanitize_filename(&decoded);
-                if !cleaned.is_empty() {
-                    cleaned
-                } else {
-                    default_attachment_filename(mime_type.as_deref())
-                }
+                percent_decode_str(seg)
             } else {
                 default_attachment_filename(mime_type.as_deref())
             }
         };
 
-        if final_filename.is_empty() {
-            final_filename = default_attachment_filename(mime_type.as_deref());
-        }
-
-        let target_path = match destination_path {
-            Some(dest) if !dest.trim().is_empty() => {
-                let trimmed_dest = dest.trim();
-                let path = Path::new(trimmed_dest);
-                let is_dir = path.is_dir()
-                    || trimmed_dest.ends_with('/')
-                    || trimmed_dest.ends_with('\\')
-                    || (path.extension().is_none() && !path.is_file());
-                if is_dir {
-                    path.join(&final_filename)
-                } else {
-                    if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
-                        let cleaned = sanitize_filename(file_name);
-                        if !cleaned.is_empty() && cleaned != "attachment" {
-                            final_filename = cleaned;
-                        }
-                    }
-                    path.to_path_buf()
-                }
-            }
-            _ => std::env::current_dir()?.join(&final_filename),
+        let filename = if filename_override.is_some() {
+            sanitize_filename(&raw_filename)
+        } else {
+            safe_attachment_filename(resource, &raw_filename)
         };
 
-        if let Some(parent) = target_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-        }
+        let target_path = resolve_and_contain_path(destination_path, &filename).await?;
 
         let mut file = tokio::fs::File::create(&target_path).await?;
         let mut bytes_written: u64 = 0;
@@ -878,15 +955,9 @@ impl CanvasApi {
         }
         tokio::io::AsyncWriteExt::flush(&mut file).await?;
 
-        let absolute_path = if target_path.is_absolute() {
-            target_path
-        } else {
-            std::env::current_dir()?.join(target_path)
-        };
-
         Ok(DownloadedFile {
-            saved_path: absolute_path.to_string_lossy().into_owned(),
-            filename: final_filename,
+            saved_path: target_path.to_string_lossy().into_owned(),
+            filename,
             bytes: bytes_written,
             mime_type,
         })
@@ -1449,6 +1520,7 @@ impl CourseSummary {
 pub struct AttachmentContents {
     pub bytes: Vec<u8>,
     pub mime_type: Option<String>,
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2221,12 +2293,19 @@ mod tests {
             Some("capital.zip".to_owned())
         );
         assert_eq!(
+            parse_content_disposition_params(r#"attachment; filename="my;problem;set.pdf"; size=100"#),
+            vec![
+                ("filename".to_owned(), "my;problem;set.pdf".to_owned()),
+                ("size".to_owned(), "100".to_owned()),
+            ]
+        );
+        assert_eq!(
             extract_content_disposition_filename(r#"attachment; filename="my;problem;set.pdf"; size=100"#),
-            Some("my;problem;set.pdf".to_owned())
+            Some("my_problem_set.pdf".to_owned())
         );
         assert_eq!(
             extract_content_disposition_filename(r#"attachment; filename="quotes \"escaped\".pdf""#),
-            Some("quotes escaped.pdf".to_owned())
+            Some("quotes _escaped_.pdf".to_owned())
         );
         assert_eq!(
             extract_content_disposition_filename("attachment"),
@@ -2241,15 +2320,15 @@ mod tests {
         assert_eq!(sanitize_filename("/var/log/test.txt"), "test.txt");
         assert_eq!(sanitize_filename("C:\\Users\\victim\\Desktop\\hack.exe"), "hack.exe");
         assert_eq!(sanitize_filename("\\\\server\\share\\hack.exe"), "hack.exe");
-        assert_eq!(sanitize_filename("foo:bar*baz?.txt"), "foobarbaz.txt");
+        assert_eq!(sanitize_filename("foo:bar*baz?.txt"), "foo_bar_baz_.txt");
         assert_eq!(sanitize_filename("   "), "attachment");
         assert_eq!(sanitize_filename("..."), "attachment");
         assert_eq!(sanitize_filename(".."), "attachment");
         assert_eq!(sanitize_filename("."), "attachment");
         assert_eq!(sanitize_filename("test.pdf...   "), "test.pdf");
         assert_eq!(sanitize_filename("%2e%2e%2f%2e%2e%2fsecret.txt"), "secret.txt");
-        assert_eq!(sanitize_filename("test\u{202e}fdp.exe"), "testfdp.exe");
-        assert_eq!(sanitize_filename("test\r\n\t\0file.txt"), "testfile.txt");
+        assert_eq!(sanitize_filename("test\u{202e}fdp.exe"), "test_fdp.exe");
+        assert_eq!(sanitize_filename("test\r\n\t\0file.txt"), "test____file.txt");
     }
 
     #[test]
@@ -2294,6 +2373,95 @@ mod tests {
             attachment_url(&origin, "files/10/download").unwrap().as_str(),
             "https://canvas.example.edu/files/10/download"
         );
+    }
+
+    #[test]
+    fn extracts_file_id_and_generates_safe_attachment_filename() {
+        assert_eq!(
+            extract_file_id_from_resource("canvas://files/12345/download"),
+            Some("12345".to_string())
+        );
+        assert_eq!(
+            extract_file_id_from_resource("canvas-text://files/987/download?verifier=abc"),
+            Some("987".to_string())
+        );
+        assert_eq!(
+            extract_file_id_from_resource("https://canvas.example.edu/files/555/download"),
+            Some("555".to_string())
+        );
+
+        assert_eq!(
+            safe_attachment_filename("canvas://files/12345/download", "homework.pdf"),
+            "12345_homework.pdf"
+        );
+        assert_eq!(
+            safe_attachment_filename("canvas://files/12345/download", "12345_homework.pdf"),
+            "12345_homework.pdf"
+        );
+        assert_eq!(
+            safe_attachment_filename("canvas://files/12345/download", "12345-homework.pdf"),
+            "12345-homework.pdf"
+        );
+        assert_eq!(
+            safe_attachment_filename("canvas://files/12345/download", "CON.pdf"),
+            "12345__CON.pdf"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_and_contains_paths_safely() {
+        let default_path = resolve_and_contain_path(None, "123_test.pdf").await.unwrap();
+        assert!(default_path.ends_with(std::path::Path::new("downloads").join("123_test.pdf")));
+
+        let custom_dir = resolve_and_contain_path(Some("downloads/subdir/"), "123_test.pdf")
+            .await
+            .unwrap();
+        assert!(custom_dir.ends_with(std::path::Path::new("subdir").join("123_test.pdf")));
+
+        let custom_file = resolve_and_contain_path(Some("downloads/custom.pdf"), "123_test.pdf")
+            .await
+            .unwrap();
+        assert!(custom_file.ends_with(std::path::Path::new("downloads").join("custom.pdf")));
+    }
+
+    #[tokio::test]
+    async fn saves_attachment_to_disk_and_returns_metadata() {
+        let api = CanvasApi {
+            canvas_origin: example_origin(),
+            cookie_header: Arc::new(RwLock::new(String::new())),
+            client: reqwest::Client::new(),
+        };
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "canvas_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = temp_dir.to_string_lossy().into_owned();
+
+        let bytes = b"test content for auto download";
+        let downloaded = api
+            .save_attachment_to_disk(
+                "canvas://files/7890/download",
+                bytes,
+                Some("lab-report.pdf"),
+                Some("application/pdf"),
+                Some(&dest),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(downloaded.filename, "7890_lab-report.pdf");
+        assert_eq!(downloaded.bytes, bytes.len() as u64);
+        assert_eq!(downloaded.mime_type.as_deref(), Some("application/pdf"));
+        assert!(std::path::Path::new(&downloaded.saved_path).exists());
+
+        let read_back = tokio::fs::read(&downloaded.saved_path).await.unwrap();
+        assert_eq!(read_back, bytes);
+
+        let _ = tokio::fs::remove_dir_all(temp_dir).await;
     }
 }
 

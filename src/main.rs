@@ -186,6 +186,21 @@ fn max_inline_attachment_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_INLINE_ATTACHMENT_BYTES)
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 const DEFAULT_TEXT_PAGE_CHARS: usize = 10_000;
 const MAX_TEXT_PAGE_CHARS: usize = 15_000;
 const MAX_DOCX_XML_BYTES: u64 = 16 * 1024 * 1024;
@@ -520,6 +535,7 @@ mod tests {
         let attachment = api::AttachmentContents {
             bytes: one_page_pdf("Practice Set 1"),
             mime_type: Some("application/pdf".to_owned()),
+            filename: None,
         };
 
         assert!(
@@ -534,6 +550,7 @@ mod tests {
         let attachment = api::AttachmentContents {
             bytes: b"problem one".to_vec(),
             mime_type: Some("text/plain; charset=utf-8".to_owned()),
+            filename: None,
         };
 
         assert_eq!(attachment_text(&attachment).unwrap(), "problem one");
@@ -693,6 +710,7 @@ mod tests {
         let attachment = api::AttachmentContents {
             bytes,
             mime_type: Some(DOCX_MIME_TYPE.to_owned()),
+            filename: None,
         };
 
         assert_eq!(
@@ -706,6 +724,7 @@ mod tests {
         let attachment = api::AttachmentContents {
             bytes: word_document("<not-xml"),
             mime_type: Some(DOCX_MIME_TYPE.to_owned()),
+            filename: None,
         };
 
         assert!(
@@ -1241,13 +1260,45 @@ impl ServerHandler for CanvasTool {
 
         let max_inline_bytes = max_inline_attachment_bytes();
         if attachment.bytes.len() > max_inline_bytes {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "Canvas attachment is {} bytes and too large for an inline MCP resource response (limit is {max_inline_bytes} bytes). Use the download_attachment tool to save it to disk (destination_path), or use the attachment_text tool for text extraction.",
-                    attachment.bytes.len()
-                ),
-                None,
-            ));
+            let downloaded = self
+                .api
+                .save_attachment_to_disk(
+                    &uri,
+                    &attachment.bytes,
+                    attachment.filename.as_deref(),
+                    attachment.mime_type.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    ErrorData::internal_error(
+                        format!("Failed to auto-download Canvas attachment: {e}"),
+                        None,
+                    )
+                })?;
+
+            let text = format!(
+                "Canvas attachment ({size_str}) exceeds the inline MCP limit ({limit_str}).\n\
+                 It was automatically downloaded to your local workspace:\n  \
+                 {saved_path}\n\n\
+                 Filename: {filename}\n\
+                 Bytes: {bytes}\n\
+                 MIME type: {mime_type}\n\n\
+                 You can inspect, read, or extract this file directly on your local system.",
+                size_str = format_bytes(downloaded.bytes),
+                limit_str = format_bytes(max_inline_bytes as u64),
+                saved_path = downloaded.saved_path,
+                filename = downloaded.filename,
+                bytes = downloaded.bytes,
+                mime_type = downloaded
+                    .mime_type
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+            );
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(text, uri).with_mime_type("text/plain")
+            ])
+            .into());
         }
 
         let mut contents = ResourceContents::blob(BASE64.encode(attachment.bytes), uri);
