@@ -75,6 +75,64 @@ struct DashboardItemsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CreatePlannerNoteParams {
+    /// Title of the planner note / custom planner item.
+    title: Option<String>,
+    /// Text content / description of the planner note.
+    details: Option<String>,
+    /// Scheduled date or timestamp (YYYY-MM-DD or ISO 8601).
+    todo_date: Option<String>,
+    /// Optional Canvas course ID to associate with the note.
+    course_id: Option<String>,
+    /// Optional learning object type to link: 'announcement', 'assignment', 'discussion_topic', 'wiki_page', 'quiz'.
+    linked_object_type: Option<String>,
+    /// Optional learning object ID to link (must be used in conjunction with linked_object_type and course_id).
+    linked_object_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct UpdatePlannerNoteParams {
+    /// Canvas planner note ID to update.
+    note_id: String,
+    /// Updated title of the planner note.
+    title: Option<String>,
+    /// Updated text content / description of the planner note.
+    details: Option<String>,
+    /// Updated date or timestamp for the note (YYYY-MM-DD or ISO 8601).
+    todo_date: Option<String>,
+    /// Updated course ID (pass empty string to remove course association).
+    course_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DeletePlannerNoteParams {
+    /// Canvas planner note ID to delete.
+    note_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PlannerNoteInfoParams {
+    /// Canvas planner note ID.
+    note_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct CourseGradesParams {
+    /// Canvas course ID.
+    course_id: String,
+    /// Optional Canvas assignment ID. If provided, returns only the grade for that specific assignment along with the course total grade. If omitted, returns all assignment grades.
+    assignment_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AssignmentGradeParams {
+    /// Canvas course ID.
+    course_id: String,
+    /// Canvas assignment ID.
+    assignment_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AttachmentTextParams {
     resource: String,
     /// Zero-based character offset into the extracted text.
@@ -878,6 +936,182 @@ impl CanvasTool {
             ContentBlock::text(metadata),
             ContentBlock::image(BASE64.encode(bytes), mime_type),
         ]))
+    }
+
+    #[tool(
+        description = "Create a custom planner item (Canvas planner note) through the Canvas REST API (POST /api/v1/planner_notes). Allows the agent to write custom to-do items and notes to self for a course or general schedule. Accepts title, details (note body text), todo_date (YYYY-MM-DD or ISO 8601), course_id, and optional linked learning object."
+    )]
+    async fn create_planner_note(
+        &self,
+        Parameters(params): Parameters<CreatePlannerNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let payload = api::CreatePlannerNotePayload {
+            title: params.title,
+            details: params.details,
+            todo_date: params.todo_date,
+            course_id: params.course_id,
+            linked_object_type: params.linked_object_type,
+            linked_object_id: params.linked_object_id,
+        };
+        let note = self.api.create_planner_note(&payload).await.map_err(|e| {
+            ErrorData::internal_error(format!("Failed to create Canvas planner note: {e}"), None)
+        })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "note": note
+        })))
+    }
+
+    #[tool(description = "Create a custom planner item in Canvas. Alias for create_planner_note.")]
+    async fn create_custom_planner_item(
+        &self,
+        params: Parameters<CreatePlannerNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.create_planner_note(params).await
+    }
+
+    #[tool(
+        description = "Edit an existing custom planner item (Canvas planner note) through the Canvas REST API (PUT /api/v1/planner_notes/:id). Pass note_id and any fields to update (title, details, todo_date, course_id)."
+    )]
+    async fn update_planner_note(
+        &self,
+        Parameters(params): Parameters<UpdatePlannerNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let payload = api::UpdatePlannerNotePayload {
+            title: params.title,
+            details: params.details,
+            todo_date: params.todo_date,
+            course_id: params.course_id,
+        };
+        let note = self
+            .api
+            .update_planner_note(&params.note_id, &payload)
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(
+                    format!("Failed to update Canvas planner note: {e}"),
+                    None,
+                )
+            })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "note": note
+        })))
+    }
+
+    #[tool(
+        description = "Edit an existing custom planner item in Canvas. Alias for update_planner_note."
+    )]
+    async fn update_custom_planner_item(
+        &self,
+        params: Parameters<UpdatePlannerNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.update_planner_note(params).await
+    }
+
+    #[tool(
+        description = "Delete a custom planner item (Canvas planner note) through the Canvas REST API (DELETE /api/v1/planner_notes/:id). Permanently removes the note from the user's planner."
+    )]
+    async fn delete_planner_note(
+        &self,
+        Parameters(DeletePlannerNoteParams { note_id }): Parameters<DeletePlannerNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = self.api.delete_planner_note(&note_id).await.map_err(|e| {
+            ErrorData::internal_error(format!("Failed to delete Canvas planner note: {e}"), None)
+        })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "deleted": true,
+            "note_id": note_id,
+            "result": result
+        })))
+    }
+
+    #[tool(description = "Delete a custom planner item in Canvas. Alias for delete_planner_note.")]
+    async fn delete_custom_planner_item(
+        &self,
+        params: Parameters<DeletePlannerNoteParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.delete_planner_note(params).await
+    }
+
+    #[tool(
+        description = "Get details of a specific custom planner item (Canvas planner note) through the read-only Canvas REST API (GET /api/v1/planner_notes/:id)."
+    )]
+    async fn planner_note_info(
+        &self,
+        Parameters(PlannerNoteInfoParams { note_id }): Parameters<PlannerNoteInfoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let note = self.api.planner_note_info(&note_id).await.map_err(|e| {
+            ErrorData::internal_error(format!("Failed to fetch Canvas planner note: {e}"), None)
+        })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "note": note
+        })))
+    }
+
+    #[tool(
+        description = "Read your grades for a Canvas course through the read-only Canvas REST API. Returns your total course grade (including current score percentage, current letter grade, final score percentage, and final letter grade) and your grade on each assignment (or a specific assignment if assignment_id is supplied), including score received, points possible, submission status (graded, submitted, unsubmitted, missing, late, excused), and timestamps."
+    )]
+    async fn course_grades(
+        &self,
+        Parameters(CourseGradesParams {
+            course_id,
+            assignment_id,
+        }): Parameters<CourseGradesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let res = self
+            .api
+            .course_grades(&course_id, assignment_id.as_deref())
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to fetch course grades: {e}"), None)
+            })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "course_grades": res
+        })))
+    }
+
+    #[tool(
+        description = "Read your grade for a specific assignment in a course through the read-only Canvas REST API. Returns the assignment grade details (score received, letter grade, points possible, submission status, due date, timestamps) along with the course's total grade."
+    )]
+    async fn assignment_grade(
+        &self,
+        Parameters(AssignmentGradeParams {
+            course_id,
+            assignment_id,
+        }): Parameters<AssignmentGradeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let res = self
+            .api
+            .course_grades(&course_id, Some(&assignment_id))
+            .await
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to fetch assignment grade: {e}"), None)
+            })?;
+
+        let assignment = res.assignments.into_iter().next();
+        Ok(CallToolResult::structured(serde_json::json!({
+            "course_id": res.course_id,
+            "course_name": res.course_name,
+            "total_grade": res.total_grade,
+            "assignment_grade": assignment
+        })))
+    }
+
+    #[tool(
+        description = "Read your total grades across all enrolled Canvas courses through the read-only Canvas REST API. Returns a summary of each course with current score percentage, current letter grade, final score percentage, final letter grade, and enrollment state."
+    )]
+    async fn grade_summary(&self) -> Result<CallToolResult, ErrorData> {
+        let res = self.api.grade_summary().await.map_err(|e| {
+            ErrorData::internal_error(format!("Failed to fetch grade summary: {e}"), None)
+        })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "grades": res
+        })))
     }
 }
 
