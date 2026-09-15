@@ -1,8 +1,9 @@
 use chrono::{Local, Months};
 use directories::ProjectDirs;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, LINK, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, LINK, USER_AGENT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thirtyfour::extensions::query::ElementPollerWithTimeout;
@@ -125,23 +126,114 @@ fn extract_csrf_token(cookie_header: &str) -> Option<String> {
 }
 
 fn attachment_url(canvas_origin: &reqwest::Url, resource: &str) -> anyhow::Result<reqwest::Url> {
-    let path = resource
-        .strip_prefix("canvas://")
-        .or_else(|| resource.strip_prefix("canvas-text://"))
-        .ok_or_else(|| anyhow::anyhow!("unsupported resource URI: {resource}"))?;
-    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+    let raw = resource.trim();
+    let path = if let Some(stripped) = raw.strip_prefix("canvas://") {
+        stripped
+    } else if let Some(stripped) = raw.strip_prefix("canvas-text://") {
+        stripped
+    } else {
+        raw
+    };
+    if path.is_empty() || path.starts_with("//") || path.contains('\\') {
         anyhow::bail!("invalid Canvas resource URI: {resource}");
     }
 
-    // A resource payload can be an absolute URL, even without a leading slash.
+    // A resource payload can be an absolute URL or a path (with or without a leading slash).
     // Validate the resolved origin before attaching session cookies.
-    let url = canvas_origin.join(path)?;
+    let url = if path.starts_with("http://") || path.starts_with("https://") {
+        reqwest::Url::parse(path)?
+    } else {
+        let relative = path.strip_prefix('/').unwrap_or(path);
+        if relative.is_empty() {
+            anyhow::bail!("invalid Canvas resource URI: {resource}");
+        }
+        canvas_origin.join(relative)?
+    };
     canvas_resource_path(canvas_origin, url.as_str())?;
     if !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("Canvas attachment URL must not contain credentials");
     }
     Ok(url)
 }
+
+pub fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim().trim_matches('"').trim();
+    let file_name = Path::new(trimmed)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(trimmed);
+    let mut cleaned = String::with_capacity(file_name.len());
+    for c in file_name.chars() {
+        if !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            cleaned.push(c);
+        }
+    }
+    let res = cleaned.trim().trim_matches('.').trim();
+    if res.is_empty() {
+        "attachment".to_owned()
+    } else {
+        res.to_owned()
+    }
+}
+
+pub fn extract_content_disposition_filename(header: &str) -> Option<String> {
+    // 1. Check for filename* parameter (RFC 5987 / RFC 6266)
+    for part in header.split(';') {
+        let trimmed = part.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("filename*=") {
+            let value = trimmed[10..].trim().trim_matches('"');
+            if let Some((_, encoded)) = value.split_once("''") {
+                let decoded = percent_decode_str(encoded);
+                let cleaned = sanitize_filename(&decoded);
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            } else if let Some(first_quote) = value.find('\'') {
+                if let Some(second_quote) = value[first_quote + 1..].find('\'') {
+                    let encoded = &value[first_quote + 1 + second_quote + 1..];
+                    let decoded = percent_decode_str(encoded);
+                    let cleaned = sanitize_filename(&decoded);
+                    if !cleaned.is_empty() {
+                        return Some(cleaned);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check for filename parameter
+    for part in header.split(';') {
+        let trimmed = part.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("filename=") {
+            let value = trimmed[9..].trim().trim_matches('"').trim();
+            let cleaned = sanitize_filename(value);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+    }
+
+    None
+}
+
+fn default_attachment_filename(mime_type: Option<&str>) -> String {
+    let ext = match mime_type.unwrap_or("") {
+        "application/pdf" => ".pdf",
+        "application/zip" | "application/x-zip-compressed" => ".zip",
+        "text/plain" => ".txt",
+        "application/json" => ".json",
+        "application/xml" | "text/xml" => ".xml",
+        "image/png" => ".png",
+        "image/jpeg" => ".jpg",
+        "image/gif" => ".gif",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => ".docx",
+        _ => "",
+    };
+    format!("attachment{ext}")
+}
+
 
 fn canvas_api_path(canvas_origin: &reqwest::Url, segments: &[&str]) -> anyhow::Result<String> {
     let mut url = canvas_origin.clone();
@@ -528,6 +620,124 @@ impl CanvasApi {
         let bytes = response.bytes().await?.to_vec();
 
         Ok(AttachmentContents { bytes, mime_type })
+    }
+
+    pub async fn download_attachment(
+        &self,
+        resource: &str,
+        destination_path: Option<&str>,
+        filename_override: Option<&str>,
+    ) -> anyhow::Result<DownloadedFile> {
+        let url = attachment_url(&self.canvas_origin, resource)?;
+        let cookie_header = self.canvas_cookie_header().await?;
+        let mut request = self.client.get(url.clone()).header(USER_AGENT, HTTP_USER_AGENT);
+        if !cookie_header.is_empty() {
+            request = request.header(COOKIE, cookie_header);
+        }
+
+        let mut response = request.send().await?.error_for_status()?;
+        let mime_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_owned());
+
+        let header_filename = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(extract_content_disposition_filename);
+
+        let mut final_filename = if let Some(override_name) =
+            filename_override.filter(|s| !s.trim().is_empty())
+        {
+            sanitize_filename(override_name)
+        } else if let Some(header_name) = header_filename {
+            header_name
+        } else {
+            let url_segment = url
+                .path_segments()
+                .and_then(|mut segs| segs.next_back())
+                .filter(|seg| !seg.is_empty() && *seg != "download");
+            if let Some(seg) = url_segment {
+                let decoded = percent_decode_str(seg);
+                let cleaned = sanitize_filename(&decoded);
+                if !cleaned.is_empty() {
+                    cleaned
+                } else {
+                    default_attachment_filename(mime_type.as_deref())
+                }
+            } else {
+                default_attachment_filename(mime_type.as_deref())
+            }
+        };
+
+        if final_filename.is_empty() {
+            final_filename = default_attachment_filename(mime_type.as_deref());
+        }
+
+        let target_path = match destination_path {
+            Some(dest) if !dest.trim().is_empty() => {
+                let path = Path::new(dest.trim());
+                let is_dir = path.is_dir()
+                    || dest.ends_with('/')
+                    || dest.ends_with('\\');
+                if is_dir {
+                    path.join(&final_filename)
+                } else {
+                    if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+                        let cleaned = sanitize_filename(file_name);
+                        if !cleaned.is_empty() {
+                            final_filename = cleaned;
+                        }
+                    }
+                    path.to_path_buf()
+                }
+            }
+            _ => std::env::current_dir()?.join(&final_filename),
+        };
+
+        if let Some(parent) = target_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+
+        let mut file = tokio::fs::File::create(&target_path).await?;
+        let mut bytes_written: u64 = 0;
+        while let Some(chunk) = response.chunk().await? {
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+            bytes_written += chunk.len() as u64;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+
+        let absolute_path = if target_path.is_absolute() {
+            target_path
+        } else {
+            std::env::current_dir()?.join(target_path)
+        };
+
+        Ok(DownloadedFile {
+            saved_path: absolute_path.to_string_lossy().into_owned(),
+            filename: final_filename,
+            bytes: bytes_written,
+            mime_type,
+        })
+    }
+
+    pub async fn download_file(
+        &self,
+        file_id: &str,
+        destination_path: Option<&str>,
+        filename_override: Option<&str>,
+    ) -> anyhow::Result<DownloadedFile> {
+        validate_numeric_id("file", file_id)?;
+        let info = self.file_info(file_id).await?;
+        let preferred_filename = filename_override
+            .or(info.display_name.as_deref())
+            .or(Some(&info.filename));
+        self.download_attachment(&info.download_resource, destination_path, preferred_filename)
+            .await
     }
 
     pub async fn dashboard_items(
@@ -1071,6 +1281,14 @@ impl CourseSummary {
 #[derive(Debug, Clone)]
 pub struct AttachmentContents {
     pub bytes: Vec<u8>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadedFile {
+    pub saved_path: String,
+    pub filename: String,
+    pub bytes: u64,
     pub mime_type: Option<String>,
 }
 
@@ -1812,4 +2030,68 @@ mod tests {
             Some(190.5)
         );
     }
+
+    #[test]
+    fn extracts_content_disposition_filenames() {
+        assert_eq!(
+            extract_content_disposition_filename(r#"attachment; filename="assignment 1.pdf""#),
+            Some("assignment 1.pdf".to_owned())
+        );
+        assert_eq!(
+            extract_content_disposition_filename("attachment; filename=data.csv"),
+            Some("data.csv".to_owned())
+        );
+        assert_eq!(
+            extract_content_disposition_filename(r#"inline; filename="notes.docx""#),
+            Some("notes.docx".to_owned())
+        );
+        assert_eq!(
+            extract_content_disposition_filename("attachment; filename*=UTF-8''my%20test%20file.pdf"),
+            Some("my test file.pdf".to_owned())
+        );
+        assert_eq!(
+            extract_content_disposition_filename(r#"attachment; FILENAME="capital.zip""#),
+            Some("capital.zip".to_owned())
+        );
+        assert_eq!(
+            extract_content_disposition_filename("attachment"),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitizes_download_filenames_against_path_traversal() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("..\\..\\Windows\\System32\\cmd.exe"), "cmd.exe");
+        assert_eq!(sanitize_filename("/var/log/test.txt"), "test.txt");
+        assert_eq!(sanitize_filename("foo:bar*baz?.txt"), "foobarbaz.txt");
+        assert_eq!(sanitize_filename("   "), "attachment");
+        assert_eq!(sanitize_filename("..."), "attachment");
+    }
+
+    #[test]
+    fn attachment_url_accepts_relative_and_full_urls() {
+        let origin = example_origin();
+        assert_eq!(
+            attachment_url(&origin, "canvas://files/10/download").unwrap().as_str(),
+            "https://canvas.example.edu/files/10/download"
+        );
+        assert_eq!(
+            attachment_url(&origin, "canvas-text://files/10/download").unwrap().as_str(),
+            "https://canvas.example.edu/files/10/download"
+        );
+        assert_eq!(
+            attachment_url(&origin, "https://canvas.example.edu/files/10/download").unwrap().as_str(),
+            "https://canvas.example.edu/files/10/download"
+        );
+        assert_eq!(
+            attachment_url(&origin, "/files/10/download").unwrap().as_str(),
+            "https://canvas.example.edu/files/10/download"
+        );
+        assert_eq!(
+            attachment_url(&origin, "files/10/download").unwrap().as_str(),
+            "https://canvas.example.edu/files/10/download"
+        );
+    }
 }
+

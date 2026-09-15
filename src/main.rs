@@ -164,7 +164,28 @@ struct PdfImageInfo {
     unsupported_reason: Option<String>,
 }
 
-const MAX_INLINE_ATTACHMENT_BYTES: usize = 24 * 1024;
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DownloadAttachmentParams {
+    /// Canvas attachment resource URI (e.g. 'canvas://files/...', 'canvas-text://files/...'), relative path, or Canvas download URL. Either resource or file_id must be provided.
+    resource: Option<String>,
+    /// Canvas file ID (can be provided instead of resource).
+    file_id: Option<String>,
+    /// Destination file or directory path. If omitted, downloads to the current working directory using the attachment's filename. If a directory path is given (or ends with a slash), the file is saved inside that directory.
+    destination_path: Option<String>,
+    /// Optional filename override. If omitted, uses the filename from Canvas or Content-Disposition.
+    filename: Option<String>,
+}
+
+const DEFAULT_MAX_INLINE_ATTACHMENT_BYTES: usize = 512 * 1024;
+const CANVAS_MAX_INLINE_BYTES_ENV: &str = "CANVAS_MAX_INLINE_BYTES";
+
+fn max_inline_attachment_bytes() -> usize {
+    std::env::var(CANVAS_MAX_INLINE_BYTES_ENV)
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_INLINE_ATTACHMENT_BYTES)
+}
+
 const DEFAULT_TEXT_PAGE_CHARS: usize = 10_000;
 const MAX_TEXT_PAGE_CHARS: usize = 15_000;
 const MAX_DOCX_XML_BYTES: u64 = 16 * 1024 * 1024;
@@ -693,6 +714,14 @@ mod tests {
                 .contains("failed to parse Word document XML")
         );
     }
+
+    #[test]
+    fn honors_max_inline_bytes_env() {
+        assert_eq!(
+            max_inline_attachment_bytes(),
+            DEFAULT_MAX_INLINE_ATTACHMENT_BYTES
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -717,7 +746,7 @@ impl CanvasTool {
     }
 
     #[tool(
-        description = "Get a specific assignment through the read-only Canvas REST API. Pass the Canvas course ID and assignment ID. Returns structured dates, grading and submission settings, HTML instructions, all attachments, and the current user's submission status when available."
+        description = "Get a specific assignment through the read-only Canvas REST API. Pass the Canvas course ID and assignment ID. Returns structured dates, grading and submission settings, HTML instructions, all attachments (use download_attachment to save them to disk), and the current user's submission status when available."
     )]
     async fn assignment_info(
         &self,
@@ -808,7 +837,7 @@ impl CanvasTool {
     }
 
     #[tool(
-        description = "Get Canvas file metadata through the read-only Files REST API. Pass the file content_id returned by module_list. Returns names, type, size, timestamps, availability, and canvas-text:// and canvas:// resources for text extraction or downloading."
+        description = "Get Canvas file metadata through the read-only Files REST API. Pass the file content_id returned by module_list. Returns names, type, size, timestamps, availability, and canvas-text:// and canvas:// resources for text extraction or downloading to disk via download_attachment."
     )]
     async fn file_info(
         &self,
@@ -936,6 +965,67 @@ impl CanvasTool {
             ContentBlock::text(metadata),
             ContentBlock::image(BASE64.encode(bytes), mime_type),
         ]))
+    }
+
+    #[tool(
+        description = "Download a Canvas attachment or file directly to local disk. Pass either 'resource' (the 'canvas://...' download_resource or 'canvas-text://...' resource from assignment_info or file_info) or 'file_id'. You can optionally specify 'destination_path' (a file path or directory) and 'filename' override. Returns the absolute saved path, filename, byte size, and MIME type."
+    )]
+    async fn download_attachment(
+        &self,
+        Parameters(params): Parameters<DownloadAttachmentParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let downloaded = if let Some(ref file_id) = params.file_id {
+            self.api
+                .download_file(
+                    file_id,
+                    params.destination_path.as_deref(),
+                    params.filename.as_deref(),
+                )
+                .await
+        } else if let Some(ref resource) = params.resource {
+            if resource.chars().all(|c| c.is_ascii_digit()) && !resource.is_empty() {
+                self.api
+                    .download_file(
+                        resource,
+                        params.destination_path.as_deref(),
+                        params.filename.as_deref(),
+                    )
+                    .await
+            } else {
+                self.api
+                    .download_attachment(
+                        resource,
+                        params.destination_path.as_deref(),
+                        params.filename.as_deref(),
+                    )
+                    .await
+            }
+        } else {
+            return Err(ErrorData::invalid_params(
+                "either 'resource' or 'file_id' must be provided",
+                None,
+            ));
+        }
+        .map_err(|e| {
+            ErrorData::internal_error(format!("Failed to download Canvas attachment: {e}"), None)
+        })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "saved_path": downloaded.saved_path,
+            "filename": downloaded.filename,
+            "bytes": downloaded.bytes,
+            "mime_type": downloaded.mime_type
+        })))
+    }
+
+    #[tool(
+        description = "Download a Canvas attachment or file directly to local disk. Alias for download_attachment."
+    )]
+    async fn attachment_download(
+        &self,
+        params: Parameters<DownloadAttachmentParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.download_attachment(params).await
     }
 
     #[tool(
@@ -1149,10 +1239,11 @@ impl ServerHandler for CanvasTool {
             return Ok(ReadResourceResult::new(vec![contents]).into());
         }
 
-        if attachment.bytes.len() > MAX_INLINE_ATTACHMENT_BYTES {
+        let max_inline_bytes = max_inline_attachment_bytes();
+        if attachment.bytes.len() > max_inline_bytes {
             return Err(ErrorData::invalid_params(
                 format!(
-                    "Canvas attachment is {} bytes and too large for one inline MCP resource response. Use the attachment_text tool, or the attachment's canvas-text:// resource, instead.",
+                    "Canvas attachment is {} bytes and too large for an inline MCP resource response (limit is {max_inline_bytes} bytes). Use the download_attachment tool to save it to disk (destination_path), or use the attachment_text tool for text extraction.",
                     attachment.bytes.len()
                 ),
                 None,
