@@ -81,6 +81,49 @@ fn validate_numeric_id(kind: &str, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn percent_decode_str(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.as_bytes().iter().copied();
+    while let Some(b) = iter.next() {
+        if b == b'%' {
+            let h1 = iter.next();
+            let h2 = iter.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                let hex_str = [h1, h2];
+                if let Ok(s) = std::str::from_utf8(&hex_str)
+                    && let Ok(byte) = u8::from_str_radix(s, 16)
+                {
+                    bytes.push(byte);
+                    continue;
+                }
+                bytes.push(b'%');
+                bytes.push(h1);
+                bytes.push(h2);
+            } else {
+                bytes.push(b'%');
+                if let Some(h1) = h1 {
+                    bytes.push(h1);
+                }
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn extract_csrf_token(cookie_header: &str) -> Option<String> {
+    for pair in cookie_header.split(';') {
+        let mut parts = pair.splitn(2, '=');
+        let name = parts.next()?.trim();
+        let value = parts.next()?.trim();
+        if name == "_csrf_token" {
+            return Some(percent_decode_str(value));
+        }
+    }
+    None
+}
+
 fn attachment_url(canvas_origin: &reqwest::Url, resource: &str) -> anyhow::Result<reqwest::Url> {
     let path = resource
         .strip_prefix("canvas://")
@@ -233,9 +276,11 @@ impl CanvasApi {
         self.api_get("/api/v1/users/self/profile", &[]).await
     }
 
-    async fn api_response(
+    async fn api_request(
         &self,
+        method: reqwest::Method,
         url: reqwest::Url,
+        body: Option<serde_json::Value>,
         cookie: &str,
     ) -> anyhow::Result<reqwest::Response> {
         let origin = &self.canvas_origin;
@@ -249,34 +294,114 @@ impl CanvasApi {
             anyhow::bail!("unexpected Canvas API URL: {url}");
         }
 
-        let response = self
+        let mut request = self
             .client
-            .get(url)
+            .request(method.clone(), url)
             .header(USER_AGENT, HTTP_USER_AGENT)
-            .header(ACCEPT, "application/json")
-            .header(COOKIE, cookie)
-            .send()
-            .await?
-            .error_for_status()?;
+            .header(ACCEPT, "application/json");
+
+        if !cookie.is_empty() {
+            request = request.header(COOKIE, cookie);
+        }
+
+        if method != reqwest::Method::GET
+            && let Some(csrf) = extract_csrf_token(cookie)
+            && !csrf.is_empty()
+        {
+            request = request.header("X-CSRF-Token", csrf);
+        }
+
+        if let Some(json_body) = body {
+            request = request
+                .header(CONTENT_TYPE, "application/json")
+                .json(&json_body);
+        }
+
+        let response = request.send().await?.error_for_status()?;
         if !is_canvas_api(response.url()) {
             anyhow::bail!(
                 "Canvas API redirected away from Canvas; the browser session may have expired. Direct the user to authenticate using the authentication tool"
             );
         }
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if !content_type
-            .to_ascii_lowercase()
-            .starts_with("application/json")
-        {
-            anyhow::bail!(
-                "Canvas API returned {content_type:?} instead of JSON; the browser session may have expired. Direct the user to authenticate using the authentication tool"
-            );
+
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            if !content_type
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+            {
+                anyhow::bail!(
+                    "Canvas API returned {content_type:?} instead of JSON; the browser session may have expired. Direct the user to authenticate using the authentication tool"
+                );
+            }
         }
         Ok(response)
+    }
+
+    async fn api_response(
+        &self,
+        url: reqwest::Url,
+        cookie: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.api_request(reqwest::Method::GET, url, None, cookie)
+            .await
+    }
+
+    async fn api_post<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> anyhow::Result<T> {
+        if !path.starts_with("/api/v1/") {
+            anyhow::bail!("Canvas API path must begin with /api/v1/");
+        }
+        let url = self.canvas_origin.join(path)?;
+        let cookie_header = self.canvas_cookie_header().await?;
+        let json_value = serde_json::to_value(body)?;
+        let response = self
+            .api_request(reqwest::Method::POST, url, Some(json_value), &cookie_header)
+            .await?;
+        Ok(serde_json::from_slice(&response.bytes().await?)?)
+    }
+
+    async fn api_put<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> anyhow::Result<T> {
+        if !path.starts_with("/api/v1/") {
+            anyhow::bail!("Canvas API path must begin with /api/v1/");
+        }
+        let url = self.canvas_origin.join(path)?;
+        let cookie_header = self.canvas_cookie_header().await?;
+        let json_value = serde_json::to_value(body)?;
+        let response = self
+            .api_request(reqwest::Method::PUT, url, Some(json_value), &cookie_header)
+            .await?;
+        Ok(serde_json::from_slice(&response.bytes().await?)?)
+    }
+
+    async fn api_delete<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        if !path.starts_with("/api/v1/") {
+            anyhow::bail!("Canvas API path must begin with /api/v1/");
+        }
+        let url = self.canvas_origin.join(path)?;
+        let cookie_header = self.canvas_cookie_header().await?;
+        let response = self
+            .api_request(reqwest::Method::DELETE, url, None, &cookie_header)
+            .await?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(serde_json::from_value(serde_json::Value::Null)?);
+        }
+        let bytes = response.bytes().await?;
+        if bytes.is_empty() {
+            return Ok(serde_json::from_value(serde_json::Value::Null)?);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     async fn api_get_paginated<T: DeserializeOwned>(
@@ -470,6 +595,210 @@ impl CanvasApi {
         self.api_get_paginated(&format!("/api/v1/courses/{course_id}/assignments"), &params)
             .await
     }
+
+    pub async fn create_planner_note(
+        &self,
+        payload: &CreatePlannerNotePayload,
+    ) -> anyhow::Result<PlannerNote> {
+        if let Some(ref course_id) = payload.course_id
+            && !course_id.is_empty()
+        {
+            validate_numeric_id("course", course_id)?;
+        }
+        if let Some(ref object_id) = payload.linked_object_id
+            && !object_id.is_empty()
+        {
+            validate_numeric_id("linked_object", object_id)?;
+        }
+        self.api_post("/api/v1/planner_notes", payload).await
+    }
+
+    pub async fn update_planner_note(
+        &self,
+        note_id: &str,
+        payload: &UpdatePlannerNotePayload,
+    ) -> anyhow::Result<PlannerNote> {
+        validate_numeric_id("planner note", note_id)?;
+        if let Some(ref course_id) = payload.course_id
+            && !course_id.is_empty()
+        {
+            validate_numeric_id("course", course_id)?;
+        }
+        self.api_put(&format!("/api/v1/planner_notes/{note_id}"), payload)
+            .await
+    }
+
+    pub async fn delete_planner_note(&self, note_id: &str) -> anyhow::Result<serde_json::Value> {
+        validate_numeric_id("planner note", note_id)?;
+        self.api_delete(&format!("/api/v1/planner_notes/{note_id}"))
+            .await
+    }
+
+    pub async fn planner_note_info(&self, note_id: &str) -> anyhow::Result<PlannerNote> {
+        validate_numeric_id("planner note", note_id)?;
+        self.api_get(&format!("/api/v1/planner_notes/{note_id}"), &[])
+            .await
+    }
+
+    pub async fn course_enrollments(
+        &self,
+        course_id: &str,
+    ) -> anyhow::Result<Vec<CourseEnrollment>> {
+        validate_numeric_id("course", course_id)?;
+        let params = vec![
+            ("user_id", "self".into()),
+            ("include[]", "total_scores".into()),
+            ("include[]", "current_points".into()),
+        ];
+        self.api_get_paginated(&format!("/api/v1/courses/{course_id}/enrollments"), &params)
+            .await
+    }
+
+    pub async fn course_grades(
+        &self,
+        course_id: &str,
+        assignment_id: Option<&str>,
+    ) -> anyhow::Result<CourseGradesReport> {
+        validate_numeric_id("course", course_id)?;
+        if let Some(aid) = assignment_id {
+            validate_numeric_id("assignment", aid)?;
+        }
+
+        let course_fut = self.course_info(course_id);
+        let assignments_fut = self.assignments(course_id);
+        let (course_res, assignments_res) = tokio::join!(course_fut, assignments_fut);
+        let course = course_res?;
+        let assignments = assignments_res?;
+
+        let extract_grade = |enrollments: &[CourseEnrollment]| -> Option<TotalGrade> {
+            for enrollment in enrollments {
+                if enrollment.current_score().is_some()
+                    || enrollment.current_grade().is_some()
+                    || enrollment.final_score().is_some()
+                    || enrollment.final_grade().is_some()
+                {
+                    return Some(TotalGrade {
+                        current_score: enrollment.current_score(),
+                        current_grade: enrollment.current_grade().map(str::to_owned),
+                        final_score: enrollment.final_score(),
+                        final_grade: enrollment.final_grade().map(str::to_owned),
+                        current_points: enrollment.grades.as_ref().and_then(|g| g.current_points),
+                        html_url: enrollment.grades.as_ref().and_then(|g| g.html_url.clone()),
+                    });
+                }
+            }
+            None
+        };
+
+        let mut total_grade = extract_grade(&course.enrollments);
+        if total_grade.is_none()
+            && let Ok(enrollments) = self.course_enrollments(course_id).await
+        {
+            total_grade = extract_grade(&enrollments);
+        }
+
+        let mut assignment_grades = Vec::new();
+        for assignment in assignments {
+            if let Some(target_id) = assignment_id
+                && assignment.id != target_id
+            {
+                continue;
+            }
+
+            let (score, grade, submitted_at, graded_at, late, missing, excused, status) =
+                if let Some(sub) = assignment.submission {
+                    let status = sub.workflow_state.unwrap_or_else(|| "unsubmitted".into());
+                    (
+                        sub.score,
+                        sub.grade,
+                        sub.submitted_at,
+                        sub.graded_at,
+                        sub.late.unwrap_or(false),
+                        sub.missing.unwrap_or(false),
+                        sub.excused.unwrap_or(false),
+                        status,
+                    )
+                } else {
+                    (
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        false,
+                        "unsubmitted".into(),
+                    )
+                };
+
+            assignment_grades.push(AssignmentGrade {
+                assignment_id: assignment.id,
+                name: assignment.name,
+                points_possible: assignment.points_possible,
+                due_at: assignment.due_at,
+                grading_type: assignment.grading_type,
+                status,
+                score,
+                grade,
+                submitted_at,
+                graded_at,
+                late,
+                missing,
+                excused,
+            });
+        }
+
+        Ok(CourseGradesReport {
+            course_id: course.id,
+            course_name: course.name,
+            total_grade,
+            assignments: assignment_grades,
+        })
+    }
+
+    pub async fn grade_summary(&self) -> anyhow::Result<Vec<CourseGradeSummary>> {
+        let courses = self.course_list().await?;
+        let mut summaries = Vec::new();
+
+        for course in courses {
+            let mut current_score = None;
+            let mut current_grade = None;
+            let mut final_score = None;
+            let mut final_grade = None;
+            let mut enrollment_state = None;
+
+            for enrollment in &course.enrollments {
+                if enrollment.current_score().is_some() || enrollment.current_grade().is_some() {
+                    current_score = enrollment.current_score();
+                    current_grade = enrollment.current_grade().map(str::to_owned);
+                    final_score = enrollment.final_score();
+                    final_grade = enrollment.final_grade().map(str::to_owned);
+                    enrollment_state = enrollment.enrollment_state.clone();
+                    break;
+                }
+            }
+
+            if enrollment_state.is_none() {
+                enrollment_state = course
+                    .enrollments
+                    .first()
+                    .and_then(|e| e.enrollment_state.clone());
+            }
+
+            summaries.push(CourseGradeSummary {
+                course_id: course.id,
+                course_name: course.name.unwrap_or_else(|| "Untitled Course".into()),
+                course_code: course.course_code,
+                current_score,
+                current_grade,
+                final_score,
+                final_grade,
+                enrollment_state,
+            });
+        }
+
+        Ok(summaries)
+    }
 }
 
 #[derive(Deserialize)]
@@ -496,6 +825,150 @@ fn optional_id<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
     Ok(Option::<CanvasId>::deserialize(deserializer)?.map(CanvasId::into_string))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FlexibleFloat {
+    Number(f64),
+    Text(String),
+}
+
+fn optional_f64<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    let opt = Option::<FlexibleFloat>::deserialize(deserializer)?;
+    match opt {
+        Some(FlexibleFloat::Number(n)) => Ok(Some(n)),
+        Some(FlexibleFloat::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<f64>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlannerNote {
+    #[serde(deserialize_with = "id")]
+    pub id: String,
+    pub title: Option<String>,
+    #[serde(default, alias = "details")]
+    pub description: Option<String>,
+    #[serde(default, deserialize_with = "optional_id")]
+    pub user_id: Option<String>,
+    pub workflow_state: Option<String>,
+    #[serde(default, deserialize_with = "optional_id")]
+    pub course_id: Option<String>,
+    pub todo_date: Option<String>,
+    pub linked_object_type: Option<String>,
+    #[serde(default, deserialize_with = "optional_id")]
+    pub linked_object_id: Option<String>,
+    pub linked_object_html_url: Option<String>,
+    pub linked_object_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePlannerNotePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub todo_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub course_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_object_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_object_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdatePlannerNotePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub todo_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub course_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EnrollmentGrades {
+    pub html_url: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub current_score: Option<f64>,
+    pub current_grade: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub final_score: Option<f64>,
+    pub final_grade: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub current_points: Option<f64>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub unposted_current_score: Option<f64>,
+    pub unposted_current_grade: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub unposted_final_score: Option<f64>,
+    pub unposted_final_grade: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub unposted_current_points: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotalGrade {
+    pub current_score: Option<f64>,
+    pub current_grade: Option<String>,
+    pub final_score: Option<f64>,
+    pub final_grade: Option<String>,
+    pub current_points: Option<f64>,
+    pub html_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignmentGrade {
+    pub assignment_id: String,
+    pub name: String,
+    pub points_possible: Option<f64>,
+    pub due_at: Option<String>,
+    pub grading_type: Option<String>,
+    pub status: String,
+    pub score: Option<f64>,
+    pub grade: Option<String>,
+    pub submitted_at: Option<String>,
+    pub graded_at: Option<String>,
+    pub late: bool,
+    pub missing: bool,
+    pub excused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CourseGradesReport {
+    pub course_id: String,
+    pub course_name: String,
+    pub total_grade: Option<TotalGrade>,
+    pub assignments: Vec<AssignmentGrade>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CourseGradeSummary {
+    pub course_id: String,
+    pub course_name: String,
+    pub course_code: Option<String>,
+    pub current_score: Option<f64>,
+    pub current_grade: Option<String>,
+    pub final_score: Option<f64>,
+    pub final_grade: Option<String>,
+    pub enrollment_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -567,25 +1040,25 @@ pub struct ModuleItemContentDetails {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CourseSummary {
     #[serde(deserialize_with = "id")]
-    id: String,
-    name: Option<String>,
-    course_code: Option<String>,
-    workflow_state: Option<String>,
-    start_at: Option<String>,
-    end_at: Option<String>,
-    time_zone: Option<String>,
-    term: Option<CourseTerm>,
+    pub id: String,
+    pub name: Option<String>,
+    pub course_code: Option<String>,
+    pub workflow_state: Option<String>,
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
+    pub time_zone: Option<String>,
+    pub term: Option<CourseTerm>,
     #[serde(default)]
-    teachers: Vec<CourseTeacher>,
+    pub teachers: Vec<CourseTeacher>,
     #[serde(default)]
-    enrollments: Vec<CourseEnrollment>,
-    is_favorite: Option<bool>,
-    concluded: Option<bool>,
-    access_restricted_by_date: Option<bool>,
+    pub enrollments: Vec<CourseEnrollment>,
+    pub is_favorite: Option<bool>,
+    pub concluded: Option<bool>,
+    pub access_restricted_by_date: Option<bool>,
     #[serde(default, skip_deserializing)]
-    course_url: String,
+    pub course_url: String,
     #[serde(default, skip_deserializing)]
-    modules_url: String,
+    pub modules_url: String,
 }
 
 impl CourseSummary {
@@ -604,28 +1077,28 @@ pub struct AttachmentContents {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssignmentInfo {
     #[serde(deserialize_with = "id")]
-    id: String,
+    pub id: String,
     #[serde(deserialize_with = "id")]
-    course_id: String,
-    name: String,
+    pub course_id: String,
+    pub name: String,
     #[serde(rename(deserialize = "description"))]
-    description_html: Option<String>,
-    due_at: Option<String>,
-    unlock_at: Option<String>,
-    lock_at: Option<String>,
-    points_possible: Option<f64>,
-    grading_type: Option<String>,
+    pub description_html: Option<String>,
+    pub due_at: Option<String>,
+    pub unlock_at: Option<String>,
+    pub lock_at: Option<String>,
+    pub points_possible: Option<f64>,
+    pub grading_type: Option<String>,
     #[serde(default)]
-    submission_types: Vec<String>,
+    pub submission_types: Vec<String>,
     #[serde(default)]
-    allowed_extensions: Vec<String>,
-    html_url: Option<String>,
-    published: Option<bool>,
-    locked_for_user: Option<bool>,
-    lock_explanation: Option<String>,
+    pub allowed_extensions: Vec<String>,
+    pub html_url: Option<String>,
+    pub published: Option<bool>,
+    pub locked_for_user: Option<bool>,
+    pub lock_explanation: Option<String>,
     #[serde(default)]
-    attachments: Vec<Attachment>,
-    submission: Option<AssignmentSubmission>,
+    pub attachments: Vec<Attachment>,
+    pub submission: Option<AssignmentSubmission>,
 }
 
 impl AssignmentInfo {
@@ -639,21 +1112,21 @@ impl AssignmentInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssignmentSummary {
     #[serde(deserialize_with = "id")]
-    id: String,
+    pub id: String,
     #[serde(deserialize_with = "id")]
-    course_id: String,
-    name: String,
-    due_at: Option<String>,
-    unlock_at: Option<String>,
-    lock_at: Option<String>,
-    points_possible: Option<f64>,
-    grading_type: Option<String>,
+    pub course_id: String,
+    pub name: String,
+    pub due_at: Option<String>,
+    pub unlock_at: Option<String>,
+    pub lock_at: Option<String>,
+    pub points_possible: Option<f64>,
+    pub grading_type: Option<String>,
     #[serde(default)]
-    submission_types: Vec<String>,
-    html_url: Option<String>,
-    published: Option<bool>,
-    locked_for_user: Option<bool>,
-    submission: Option<AssignmentSubmission>,
+    pub submission_types: Vec<String>,
+    pub html_url: Option<String>,
+    pub published: Option<bool>,
+    pub locked_for_user: Option<bool>,
+    pub submission: Option<AssignmentSubmission>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -720,72 +1193,106 @@ impl FileInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CourseInfo {
     #[serde(deserialize_with = "id")]
-    id: String,
-    name: String,
-    course_code: Option<String>,
+    pub id: String,
+    pub name: String,
+    pub course_code: Option<String>,
     #[serde(default, deserialize_with = "optional_id")]
-    account_id: Option<String>,
+    pub account_id: Option<String>,
     #[serde(default, deserialize_with = "optional_id")]
-    enrollment_term_id: Option<String>,
-    start_at: Option<String>,
-    end_at: Option<String>,
-    time_zone: Option<String>,
-    workflow_state: Option<String>,
-    default_view: Option<String>,
+    pub enrollment_term_id: Option<String>,
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
+    pub time_zone: Option<String>,
+    pub workflow_state: Option<String>,
+    pub default_view: Option<String>,
     #[serde(rename(deserialize = "syllabus_body"))]
-    syllabus_body_html: Option<String>,
-    term: Option<CourseTerm>,
+    pub syllabus_body_html: Option<String>,
+    pub term: Option<CourseTerm>,
     #[serde(default)]
-    teachers: Vec<CourseTeacher>,
+    pub teachers: Vec<CourseTeacher>,
     #[serde(default)]
-    enrollments: Vec<CourseEnrollment>,
+    pub enrollments: Vec<CourseEnrollment>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CourseTerm {
     #[serde(default, deserialize_with = "optional_id")]
-    id: Option<String>,
-    name: Option<String>,
-    start_at: Option<String>,
-    end_at: Option<String>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CourseTeacher {
     #[serde(default, deserialize_with = "optional_id")]
-    id: Option<String>,
-    display_name: Option<String>,
-    avatar_image_url: Option<String>,
-    html_url: Option<String>,
+    pub id: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_image_url: Option<String>,
+    pub html_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CourseEnrollment {
     #[serde(rename(deserialize = "type"))]
-    enrollment_type: Option<String>,
-    role: Option<String>,
-    enrollment_state: Option<String>,
-    computed_current_score: Option<f64>,
-    computed_current_grade: Option<String>,
-    computed_final_score: Option<f64>,
-    computed_final_grade: Option<String>,
+    pub enrollment_type: Option<String>,
+    pub role: Option<String>,
+    pub enrollment_state: Option<String>,
+    #[serde(default)]
+    pub grades: Option<EnrollmentGrades>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub computed_current_score: Option<f64>,
+    pub computed_current_grade: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub computed_final_score: Option<f64>,
+    pub computed_final_grade: Option<String>,
+}
+
+impl CourseEnrollment {
+    pub fn current_score(&self) -> Option<f64> {
+        self.grades
+            .as_ref()
+            .and_then(|g| g.current_score)
+            .or(self.computed_current_score)
+    }
+
+    pub fn current_grade(&self) -> Option<&str> {
+        self.grades
+            .as_ref()
+            .and_then(|g| g.current_grade.as_deref())
+            .or(self.computed_current_grade.as_deref())
+    }
+
+    pub fn final_score(&self) -> Option<f64> {
+        self.grades
+            .as_ref()
+            .and_then(|g| g.final_score)
+            .or(self.computed_final_score)
+    }
+
+    pub fn final_grade(&self) -> Option<&str> {
+        self.grades
+            .as_ref()
+            .and_then(|g| g.final_grade.as_deref())
+            .or(self.computed_final_grade.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Attachment {
     #[serde(default, deserialize_with = "optional_id")]
-    id: Option<String>,
-    filename: String,
-    display_name: Option<String>,
+    pub id: Option<String>,
+    pub filename: String,
+    pub display_name: Option<String>,
     #[serde(rename(deserialize = "content-type"), alias = "content_type")]
-    content_type: Option<String>,
-    size: Option<u64>,
+    pub content_type: Option<String>,
+    pub size: Option<u64>,
     #[serde(skip_serializing)]
-    url: String,
+    pub url: String,
     #[serde(default, skip_deserializing)]
-    resource: String,
+    pub resource: String,
     #[serde(default, skip_deserializing)]
-    download_resource: String,
+    pub download_resource: String,
 }
 
 impl Attachment {
@@ -800,16 +1307,17 @@ impl Attachment {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssignmentSubmission {
     #[serde(default, deserialize_with = "optional_id")]
-    id: Option<String>,
-    attempt: Option<u64>,
-    submitted_at: Option<String>,
-    workflow_state: Option<String>,
-    score: Option<f64>,
-    grade: Option<String>,
-    late: Option<bool>,
-    missing: Option<bool>,
-    excused: Option<bool>,
-    graded_at: Option<String>,
+    pub id: Option<String>,
+    pub attempt: Option<u64>,
+    pub submitted_at: Option<String>,
+    pub workflow_state: Option<String>,
+    #[serde(default, deserialize_with = "optional_f64")]
+    pub score: Option<f64>,
+    pub grade: Option<String>,
+    pub late: Option<bool>,
+    pub missing: Option<bool>,
+    pub excused: Option<bool>,
+    pub graded_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1182,6 +1690,126 @@ mod tests {
             )
             .unwrap(),
             "/api/v1/courses/42/pages/week%201%2Freadings"
+        );
+    }
+
+    #[test]
+    fn extracts_and_decodes_csrf_tokens() {
+        let cookie = "session=123; _csrf_token=abc%2Bdef%3D%2Fghi; other=xyz";
+        assert_eq!(extract_csrf_token(cookie).as_deref(), Some("abc+def=/ghi"));
+
+        let unencoded = "_csrf_token=simple_token_123; session=456";
+        assert_eq!(
+            extract_csrf_token(unencoded).as_deref(),
+            Some("simple_token_123")
+        );
+
+        let no_csrf = "session=123; user_id=456";
+        assert_eq!(extract_csrf_token(no_csrf), None);
+    }
+
+    #[test]
+    fn deserializes_planner_notes_with_flexible_ids_and_aliases() {
+        let json = serde_json::json!({
+            "id": 234,
+            "title": "Bring books tomorrow",
+            "details": "I need to bring books tomorrow for my course on biology",
+            "user_id": 1578941,
+            "workflow_state": "active",
+            "course_id": 1578941,
+            "todo_date": "2017-05-09T10:12:00Z",
+            "linked_object_type": "assignment",
+            "linked_object_id": 131072,
+            "linked_object_html_url": "https://canvas.example.com/courses/1578941/assignments/131072",
+            "linked_object_url": "https://canvas.example.com/api/v1/courses/1578941/assignments/131072"
+        });
+
+        let note: PlannerNote = serde_json::from_value(json).unwrap();
+        assert_eq!(note.id, "234");
+        assert_eq!(note.title.as_deref(), Some("Bring books tomorrow"));
+        assert_eq!(
+            note.description.as_deref(),
+            Some("I need to bring books tomorrow for my course on biology")
+        );
+        assert_eq!(note.user_id.as_deref(), Some("1578941"));
+        assert_eq!(note.course_id.as_deref(), Some("1578941"));
+        assert_eq!(note.linked_object_type.as_deref(), Some("assignment"));
+        assert_eq!(note.linked_object_id.as_deref(), Some("131072"));
+    }
+
+    #[test]
+    fn serializes_planner_note_payloads() {
+        let payload = CreatePlannerNotePayload {
+            title: Some("Study for Exam".into()),
+            details: Some("Chapters 1-4".into()),
+            todo_date: Some("2026-09-20".into()),
+            course_id: Some("42".into()),
+            linked_object_type: None,
+            linked_object_id: None,
+        };
+
+        let val = serde_json::to_value(&payload).unwrap();
+        assert_eq!(val["title"], "Study for Exam");
+        assert_eq!(val["details"], "Chapters 1-4");
+        assert_eq!(val["todo_date"], "2026-09-20");
+        assert_eq!(val["course_id"], "42");
+        assert!(val.get("linked_object_type").is_none());
+
+        let update_payload = UpdatePlannerNotePayload {
+            title: Some("Updated Title".into()),
+            details: None,
+            todo_date: None,
+            course_id: Some("".into()),
+        };
+        let update_val = serde_json::to_value(&update_payload).unwrap();
+        assert_eq!(update_val["title"], "Updated Title");
+        assert_eq!(update_val["course_id"], "");
+        assert!(update_val.get("details").is_none());
+    }
+
+    #[test]
+    fn deserializes_course_enrollment_with_flat_and_nested_grades() {
+        // Test flat computed_* fields
+        let flat_json = serde_json::json!({
+            "type": "StudentEnrollment",
+            "role": "StudentEnrollment",
+            "enrollment_state": "active",
+            "computed_current_score": 92.5,
+            "computed_current_grade": "A",
+            "computed_final_score": 88.0,
+            "computed_final_grade": "B+"
+        });
+        let flat_enrollment: CourseEnrollment = serde_json::from_value(flat_json).unwrap();
+        assert_eq!(flat_enrollment.current_score(), Some(92.5));
+        assert_eq!(flat_enrollment.current_grade(), Some("A"));
+        assert_eq!(flat_enrollment.final_score(), Some(88.0));
+        assert_eq!(flat_enrollment.final_grade(), Some("B+"));
+
+        // Test nested grades hash with string-formatted scores and empty string
+        let nested_json = serde_json::json!({
+            "type": "StudentEnrollment",
+            "role": "StudentEnrollment",
+            "enrollment_state": "active",
+            "grades": {
+                "html_url": "https://canvas.example.edu/courses/42/grades",
+                "current_score": "95.5",
+                "current_grade": "A",
+                "final_score": "",
+                "final_grade": null,
+                "current_points": 190.5
+            }
+        });
+        let nested_enrollment: CourseEnrollment = serde_json::from_value(nested_json).unwrap();
+        assert_eq!(nested_enrollment.current_score(), Some(95.5));
+        assert_eq!(nested_enrollment.current_grade(), Some("A"));
+        assert_eq!(nested_enrollment.final_score(), None);
+        assert_eq!(nested_enrollment.final_grade(), None);
+        assert_eq!(
+            nested_enrollment
+                .grades
+                .as_ref()
+                .and_then(|g| g.current_points),
+            Some(190.5)
         );
     }
 }
