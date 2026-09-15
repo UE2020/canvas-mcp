@@ -1,5 +1,5 @@
 use chrono::{Local, Months};
-use directories::ProjectDirs;
+use directories::{ProjectDirs, UserDirs};
 use reqwest::header::{ACCEPT, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, LINK, USER_AGENT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashSet;
@@ -421,14 +421,27 @@ pub fn safe_attachment_filename(resource: &str, raw_name: &str) -> String {
     }
 }
 
+pub fn default_download_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("CANVAS_DOWNLOAD_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir.trim());
+        }
+    }
+    if let Some(user_dirs) = UserDirs::new() {
+        if let Some(download_dir) = user_dirs.download_dir() {
+            return download_dir.join("Canvas");
+        }
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join("downloads"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("downloads"))
+}
+
 pub async fn resolve_and_contain_path(
     destination: Option<&str>,
     filename: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let default_dir = match std::env::var("CANVAS_DOWNLOAD_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir.trim()),
-        _ => std::env::current_dir()?.join("downloads"),
-    };
+    let default_dir = default_download_dir();
 
     let target_path = match destination {
         Some(dest) if !dest.trim().is_empty() => {
@@ -2410,8 +2423,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_and_contains_paths_safely() {
+        let expected_dir = default_download_dir();
         let default_path = resolve_and_contain_path(None, "123_test.pdf").await.unwrap();
-        assert!(default_path.ends_with(std::path::Path::new("downloads").join("123_test.pdf")));
+        assert_eq!(default_path, expected_dir.join("123_test.pdf"));
 
         let custom_dir = resolve_and_contain_path(Some("downloads/subdir/"), "123_test.pdf")
             .await

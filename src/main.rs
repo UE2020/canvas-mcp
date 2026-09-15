@@ -987,7 +987,7 @@ impl CanvasTool {
     }
 
     #[tool(
-        description = "Download a Canvas attachment or file directly to local disk. Pass either 'resource' (the 'canvas://...' download_resource or 'canvas-text://...' resource from assignment_info or file_info) or 'file_id'. You can optionally specify 'destination_path' (a file path or directory) and 'filename' override. Returns the absolute saved path, filename, byte size, and MIME type."
+        description = "Download a Canvas attachment or file directly to local disk. Pass either 'resource' (the 'canvas://...' download_resource or 'canvas-text://...' resource from assignment_info or file_info) or 'file_id'. You can optionally specify 'destination_path' (a file path or directory; defaults to the OS Downloads/Canvas folder or CANVAS_DOWNLOAD_DIR) and 'filename' override. Returns the absolute saved path, filename, byte size, and MIME type."
     )]
     async fn download_attachment(
         &self,
@@ -1279,7 +1279,7 @@ impl ServerHandler for CanvasTool {
 
             let text = format!(
                 "Canvas attachment ({size_str}) exceeds the inline MCP limit ({limit_str}).\n\
-                 It was automatically downloaded to your local workspace:\n  \
+                 It was automatically downloaded to:\n  \
                  {saved_path}\n\n\
                  Filename: {filename}\n\
                  Bytes: {bytes}\n\
