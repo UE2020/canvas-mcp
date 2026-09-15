@@ -156,60 +156,225 @@ fn attachment_url(canvas_origin: &reqwest::Url, resource: &str) -> anyhow::Resul
     Ok(url)
 }
 
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM0"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT0"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
 pub fn sanitize_filename(name: &str) -> String {
-    let trimmed = name.trim().trim_matches('"').trim();
-    let file_name = Path::new(trimmed)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(trimmed);
-    let mut cleaned = String::with_capacity(file_name.len());
-    for c in file_name.chars() {
-        if !matches!(c, '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-            cleaned.push(c);
-        }
+    let raw = name.trim().trim_matches('"').trim();
+    if raw.is_empty() {
+        return "attachment".to_owned();
     }
-    let res = cleaned.trim().trim_matches('.').trim();
-    if res.is_empty() {
-        "attachment".to_owned()
+
+    // Decode percent-encoding if present (e.g. %2e%2e or %2f)
+    let decoded = if raw.contains('%') {
+        percent_decode_str(raw)
     } else {
-        res.to_owned()
+        raw.to_owned()
+    };
+
+    // Extract the final path segment across both UNIX and Windows separators
+    let last_segment = decoded
+        .split(|c| c == '/' || c == '\\')
+        .filter(|seg| !seg.is_empty())
+        .last()
+        .unwrap_or("attachment");
+
+    // Filter out control characters, illegal filesystem characters, and Unicode BIDI / zero-width characters
+    let mut cleaned = String::with_capacity(last_segment.len());
+    for c in last_segment.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0') {
+            continue;
+        }
+        if matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        ) {
+            continue;
+        }
+        cleaned.push(c);
+    }
+
+    // Strip leading/trailing whitespace and trailing dots (Windows strips trailing dots/spaces)
+    let trimmed = cleaned
+        .trim()
+        .trim_end_matches(|c| c == ' ' || c == '.')
+        .to_owned();
+
+    // If empty or all dots (e.g. "." or ".."), fall back to default
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
+        return "attachment".to_owned();
+    }
+
+    // Defuse Windows reserved device names (e.g. CON, PRN, AUX, NUL, COM1..9, LPT1..9)
+    let stem = trimmed.split('.').next().unwrap_or(&trimmed);
+    let safe_device_name = if is_windows_reserved_stem(stem) {
+        format!("_{trimmed}")
+    } else {
+        trimmed
+    };
+
+    // Limit length to 200 characters to prevent filesystem ENAMETOOLONG errors, preserving extension
+    if safe_device_name.len() > 200 {
+        if let Some(dot_idx) = safe_device_name.rfind('.') {
+            let ext = &safe_device_name[dot_idx..];
+            if ext.len() < 30 {
+                let stem_len = 200 - ext.len();
+                let truncated: String = safe_device_name[..dot_idx].chars().take(stem_len).collect();
+                return format!("{truncated}{ext}");
+            }
+        }
+        let truncated: String = safe_device_name.chars().take(200).collect();
+        truncated
+    } else {
+        safe_device_name
     }
 }
 
-pub fn extract_content_disposition_filename(header: &str) -> Option<String> {
-    // 1. Check for filename* parameter (RFC 5987 / RFC 6266)
-    for part in header.split(';') {
-        let trimmed = part.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("filename*=") {
-            let value = trimmed[10..].trim().trim_matches('"');
-            if let Some((_, encoded)) = value.split_once("''") {
-                let decoded = percent_decode_str(encoded);
-                let cleaned = sanitize_filename(&decoded);
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
+fn parse_content_disposition_params(header: &str) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let mut chars = header.chars().peekable();
+
+    // Skip disposition-type (e.g. "attachment" or "inline")
+    while let Some(&c) = chars.peek() {
+        if c == ';' {
+            chars.next();
+            break;
+        }
+        chars.next();
+    }
+
+    while chars.peek().is_some() {
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() || c == ';' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' || c == ';' || c.is_whitespace() {
+                break;
+            }
+            key.push(c);
+            chars.next();
+        }
+
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if chars.peek() == Some(&'=') {
+            chars.next(); // consume '='
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
                 }
-            } else if let Some(first_quote) = value.find('\'') {
-                if let Some(second_quote) = value[first_quote + 1..].find('\'') {
-                    let encoded = &value[first_quote + 1 + second_quote + 1..];
-                    let decoded = percent_decode_str(encoded);
-                    let cleaned = sanitize_filename(&decoded);
-                    if !cleaned.is_empty() {
-                        return Some(cleaned);
+            }
+
+            let mut val = String::new();
+            if chars.peek() == Some(&'"') {
+                chars.next(); // consume opening quote
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            val.push(escaped);
+                        }
+                    } else if c == '"' {
+                        break; // closing quote
+                    } else {
+                        val.push(c);
                     }
                 }
+            } else {
+                while let Some(&c) = chars.peek() {
+                    if c == ';' || c.is_whitespace() {
+                        break;
+                    }
+                    val.push(c);
+                    chars.next();
+                }
+            }
+            params.push((key.to_ascii_lowercase(), val));
+        }
+    }
+    params
+}
+
+pub fn extract_content_disposition_filename(header: &str) -> Option<String> {
+    let params = parse_content_disposition_params(header);
+
+    // 1. Check for filename* parameter (RFC 5987 / RFC 6266 precedence)
+    for (key, val) in &params {
+        if key == "filename*" {
+            let encoded = if let Some((_, enc)) = val.split_once("''") {
+                enc
+            } else if let Some(first_quote) = val.find('\'') {
+                if let Some(second_quote) = val[first_quote + 1..].find('\'') {
+                    &val[first_quote + 1 + second_quote + 1..]
+                } else {
+                    val.as_str()
+                }
+            } else {
+                val.as_str()
+            };
+            let decoded = percent_decode_str(encoded);
+            let cleaned = sanitize_filename(&decoded);
+            if !cleaned.is_empty() && cleaned != "attachment" {
+                return Some(cleaned);
             }
         }
     }
 
     // 2. Check for filename parameter
-    for part in header.split(';') {
-        let trimmed = part.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.starts_with("filename=") {
-            let value = trimmed[9..].trim().trim_matches('"').trim();
-            let cleaned = sanitize_filename(value);
-            if !cleaned.is_empty() {
+    for (key, val) in &params {
+        if key == "filename" {
+            let cleaned = sanitize_filename(val);
+            if !cleaned.is_empty() && cleaned != "attachment" {
                 return Some(cleaned);
             }
         }
@@ -678,16 +843,18 @@ impl CanvasApi {
 
         let target_path = match destination_path {
             Some(dest) if !dest.trim().is_empty() => {
-                let path = Path::new(dest.trim());
+                let trimmed_dest = dest.trim();
+                let path = Path::new(trimmed_dest);
                 let is_dir = path.is_dir()
-                    || dest.ends_with('/')
-                    || dest.ends_with('\\');
+                    || trimmed_dest.ends_with('/')
+                    || trimmed_dest.ends_with('\\')
+                    || (path.extension().is_none() && !path.is_file());
                 if is_dir {
                     path.join(&final_filename)
                 } else {
                     if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
                         let cleaned = sanitize_filename(file_name);
-                        if !cleaned.is_empty() {
+                        if !cleaned.is_empty() && cleaned != "attachment" {
                             final_filename = cleaned;
                         }
                     }
@@ -2054,6 +2221,14 @@ mod tests {
             Some("capital.zip".to_owned())
         );
         assert_eq!(
+            extract_content_disposition_filename(r#"attachment; filename="my;problem;set.pdf"; size=100"#),
+            Some("my;problem;set.pdf".to_owned())
+        );
+        assert_eq!(
+            extract_content_disposition_filename(r#"attachment; filename="quotes \"escaped\".pdf""#),
+            Some("quotes escaped.pdf".to_owned())
+        );
+        assert_eq!(
             extract_content_disposition_filename("attachment"),
             None
         );
@@ -2064,9 +2239,36 @@ mod tests {
         assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_filename("..\\..\\Windows\\System32\\cmd.exe"), "cmd.exe");
         assert_eq!(sanitize_filename("/var/log/test.txt"), "test.txt");
+        assert_eq!(sanitize_filename("C:\\Users\\victim\\Desktop\\hack.exe"), "hack.exe");
+        assert_eq!(sanitize_filename("\\\\server\\share\\hack.exe"), "hack.exe");
         assert_eq!(sanitize_filename("foo:bar*baz?.txt"), "foobarbaz.txt");
         assert_eq!(sanitize_filename("   "), "attachment");
         assert_eq!(sanitize_filename("..."), "attachment");
+        assert_eq!(sanitize_filename(".."), "attachment");
+        assert_eq!(sanitize_filename("."), "attachment");
+        assert_eq!(sanitize_filename("test.pdf...   "), "test.pdf");
+        assert_eq!(sanitize_filename("%2e%2e%2f%2e%2e%2fsecret.txt"), "secret.txt");
+        assert_eq!(sanitize_filename("test\u{202e}fdp.exe"), "testfdp.exe");
+        assert_eq!(sanitize_filename("test\r\n\t\0file.txt"), "testfile.txt");
+    }
+
+    #[test]
+    fn sanitizes_windows_reserved_device_names() {
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("con.txt"), "_con.txt");
+        assert_eq!(sanitize_filename("AUX.pdf"), "_AUX.pdf");
+        assert_eq!(sanitize_filename("nul.zip"), "_nul.zip");
+        assert_eq!(sanitize_filename("com1.tar.gz"), "_com1.tar.gz");
+        assert_eq!(sanitize_filename("lpt9"), "_lpt9");
+        assert_eq!(sanitize_filename("contact.txt"), "contact.txt");
+    }
+
+    #[test]
+    fn truncates_overly_long_filenames_preserving_extension() {
+        let long_name = format!("{}.pdf", "a".repeat(300));
+        let sanitized = sanitize_filename(&long_name);
+        assert!(sanitized.len() <= 200);
+        assert!(sanitized.ends_with(".pdf"));
     }
 
     #[test]
