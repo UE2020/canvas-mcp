@@ -20,6 +20,8 @@ args = []
 CANVAS_URL = "https://canvas.university.edu"
 # Optional: customize inline attachment resource size limit in bytes (defaults to 524288 / 512KB)
 # CANVAS_MAX_INLINE_BYTES = "1048576"
+# Optional: customize directory where attachments are downloaded (defaults to OS Downloads/Canvas)
+# CANVAS_DOWNLOAD_DIR = "C:\\path\\to\\custom\\downloads"
 ```
 
 The first time you use it, ask your agent to run the authentication tool. This will open a browser window where you'll have to log into Canvas. Once you're logged in, just close the window.
@@ -47,6 +49,6 @@ The first time you use it, ask your agent to run the authentication tool. This w
   - `delete_planner_note` / `delete_custom_planner_item`: Delete a custom planner note
   - `planner_note_info`: Retrieve details of a specific planner note
 - **Attachments**:
-  - `download_attachment` / `attachment_download`: Download binary or text attachments directly to local disk (supports custom destination paths/directories and Canvas file IDs)
+  - `download_attachment` / `attachment_download`: Download binary or text attachments directly to local disk (defaults to OS `Downloads/Canvas`, supports custom destination paths/directories and Canvas file IDs)
   - `attachment_text`: Inspect extracted text from PDF, Word (.docx), or text attachments
   - `attachment_image`: Extract embedded images from PDF documents
