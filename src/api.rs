@@ -564,6 +564,13 @@ async fn load_cookie_header(canvas_origin: &reqwest::Url) -> anyhow::Result<Stri
         .join("; "))
 }
 
+fn should_refresh_and_retry(
+    method: &reqwest::Method,
+    status: reqwest::StatusCode,
+) -> bool {
+    *method == reqwest::Method::GET && status == reqwest::StatusCode::UNAUTHORIZED
+}
+
 #[derive(Clone)]
 pub struct CanvasApi {
     canvas_origin: reqwest::Url,
@@ -599,34 +606,44 @@ impl CanvasApi {
         Ok(cookie_header.clone())
     }
 
+    async fn replace_cached_cookie_header(&self, cookies: String) -> anyhow::Result<String> {
+        if cookies.trim().is_empty() {
+            anyhow::bail!(
+                "no Canvas cookies are available in the saved browser profile; interactive authentication is required"
+            );
+        }
+        *self.cookie_header.write().await = cookies.clone();
+        Ok(cookies)
+    }
+
+    async fn reload_cookie_header(&self) -> anyhow::Result<String> {
+        let _profile_lock = lock_chrome_profile().await?;
+        let cookies = load_cookie_header(&self.canvas_origin).await?;
+        self.replace_cached_cookie_header(cookies).await
+    }
+
     pub async fn authenticate(&self) -> anyhow::Result<AuthenticatedUser> {
         {
             let _profile_lock = lock_chrome_profile().await?;
             login(&self.canvas_origin).await?;
             let cookies = load_cookie_header(&self.canvas_origin).await?;
-            *self.cookie_header.write().await = cookies;
+            self.replace_cached_cookie_header(cookies).await?;
         }
         self.api_get("/api/v1/users/self/profile", &[]).await
     }
 
-    async fn api_request(
+    pub async fn refresh_authentication(&self) -> anyhow::Result<AuthenticatedUser> {
+        self.reload_cookie_header().await?;
+        self.api_get("/api/v1/users/self/profile", &[]).await
+    }
+
+    async fn send_api_request(
         &self,
         method: reqwest::Method,
         url: reqwest::Url,
-        body: Option<serde_json::Value>,
+        body: Option<&serde_json::Value>,
         cookie: &str,
     ) -> anyhow::Result<reqwest::Response> {
-        let origin = &self.canvas_origin;
-        let is_canvas_api = |url: &reqwest::Url| {
-            url.scheme() == origin.scheme()
-                && url.host_str() == origin.host_str()
-                && url.port_or_known_default() == origin.port_or_known_default()
-                && url.path().starts_with("/api/v1/")
-        };
-        if !is_canvas_api(&url) {
-            anyhow::bail!("unexpected Canvas API URL: {url}");
-        }
-
         let mut request = self
             .client
             .request(method.clone(), url)
@@ -647,10 +664,47 @@ impl CanvasApi {
         if let Some(json_body) = body {
             request = request
                 .header(CONTENT_TYPE, "application/json")
-                .json(&json_body);
+                .json(json_body);
         }
 
-        let response = request.send().await?.error_for_status()?;
+        Ok(request.send().await?)
+    }
+
+    async fn api_request(
+        &self,
+        method: reqwest::Method,
+        url: reqwest::Url,
+        body: Option<serde_json::Value>,
+        cookie: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        let origin = &self.canvas_origin;
+        let is_canvas_api = |url: &reqwest::Url| {
+            url.scheme() == origin.scheme()
+                && url.host_str() == origin.host_str()
+                && url.port_or_known_default() == origin.port_or_known_default()
+                && url.path().starts_with("/api/v1/")
+        };
+        if !is_canvas_api(&url) {
+            anyhow::bail!("unexpected Canvas API URL: {url}");
+        }
+
+        let mut response = self
+            .send_api_request(method.clone(), url.clone(), body.as_ref(), cookie)
+            .await?;
+        if should_refresh_and_retry(&method, response.status()) {
+            let refreshed_cookie = {
+                let current_cookie = self.canvas_cookie_header().await?;
+                if current_cookie != cookie {
+                    current_cookie
+                } else {
+                    self.reload_cookie_header().await?
+                }
+            };
+            response = self
+                .send_api_request(method, url, body.as_ref(), &refreshed_cookie)
+                .await?;
+        }
+        let response = response.error_for_status()?;
         if !is_canvas_api(response.url()) {
             anyhow::bail!(
                 "Canvas API redirected away from Canvas; the browser session may have expired. Direct the user to authenticate using the authentication tool"
@@ -1973,6 +2027,37 @@ mod tests {
             clone.canvas_cookie_header().await.unwrap(),
             "session=refreshed"
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_cached_cookies_rejects_an_empty_browser_session() {
+        let api = CanvasApi {
+            canvas_origin: example_origin(),
+            cookie_header: Arc::new(RwLock::new("session=current".into())),
+            client: reqwest::Client::new(),
+        };
+
+        assert!(api.replace_cached_cookie_header(String::new()).await.is_err());
+        assert_eq!(
+            api.canvas_cookie_header().await.unwrap(),
+            "session=current"
+        );
+    }
+
+    #[test]
+    fn retries_only_safe_get_requests_after_unauthorized() {
+        assert!(should_refresh_and_retry(
+            &reqwest::Method::GET,
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!should_refresh_and_retry(
+            &reqwest::Method::POST,
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!should_refresh_and_retry(
+            &reqwest::Method::GET,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     #[test]

@@ -751,7 +751,7 @@ struct CanvasTool {
 #[tool_router]
 impl CanvasTool {
     #[tool(
-        description = "Authenticate the Canvas connector with the user's institutional login. Use this tool whenever another Canvas tool reports that cookies are missing, the session expired, or Canvas redirected to a login page. Before calling it, inform the user that the Canvas session is not authenticated and that a visible browser will open; ask them to finish signing in and close the browser window when done. The connector refreshes its cached cookies afterward and closes the browser."
+        description = "Interactively authenticate the Canvas connector with the user's institutional login. Use this only when refresh_auth cannot restore the saved session. Before calling it, inform the user that a visible browser will open; ask them to finish signing in and close the browser window when done. The connector refreshes its cached cookies afterward."
     )]
     async fn auth(&self) -> Result<CallToolResult, ErrorData> {
         let user = self.api.authenticate().await.map_err(|e| {
@@ -760,6 +760,24 @@ impl CanvasTool {
 
         Ok(CallToolResult::structured(serde_json::json!({
             "authenticated": true,
+            "user": user
+        })))
+    }
+
+    #[tool(
+        description = "Refresh Canvas authentication noninteractively from the connector's saved browser profile. No visible window is opened and no user action is required. Use this when another Canvas tool reports 401 Unauthorized, stale cookies, or an expired cached session. If the saved browser session itself has expired, this returns an error and interactive auth is required."
+    )]
+    async fn refresh_auth(&self) -> Result<CallToolResult, ErrorData> {
+        let user = self.api.refresh_authentication().await.map_err(|e| {
+            ErrorData::internal_error(
+                format!("Failed to refresh Canvas authentication: {e}"),
+                None,
+            )
+        })?;
+
+        Ok(CallToolResult::structured(serde_json::json!({
+            "authenticated": true,
+            "refreshed_noninteractively": true,
             "user": user
         })))
     }

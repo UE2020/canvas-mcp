@@ -28,7 +28,9 @@ The first time you use it, ask your agent to run the authentication tool. This w
 
 # Features & Tool Calls
 
-- **Authentication**: `auth` (logs into Canvas via browser session)
+- **Authentication**:
+  - `refresh_auth`: silently reload and validate cookies from the saved browser profile
+  - `auth`: open a visible browser for interactive login when the saved session has expired
 - **Courses & Content**:
   - `course_list`: List user's courses with details and grades
   - `course_info`: Structured course details and syllabus
